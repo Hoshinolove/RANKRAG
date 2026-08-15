@@ -14,8 +14,7 @@ from rankrag.io import iter_results, write_json, write_jsonl
 from rankrag.llm.cache import LLMResponseCache
 from rankrag.llm.client import create_provider
 from rankrag.llm.reranker import LLMReranker
-from rankrag.ranker.features import RankerFeatureBuilder
-from rankrag.ranker.mlp import MLPRanker, NeuralReranker, load_checkpoint
+from rankrag.ranker.tensor_inference import iter_tensor_rankings
 
 
 class CascadePipeline:
@@ -31,7 +30,13 @@ class CascadePipeline:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if self.config_path:
             shutil.copyfile(self.config_path, self.output_dir / "config.yaml")
-        self.embedder = create_embedder(config.get("embedding", {}))
+        self._embedder = None
+
+    @property
+    def embedder(self):
+        if self._embedder is None:
+            self._embedder = create_embedder(self.config.get("embedding", {}))
+        return self._embedder
 
     @property
     def graphrag_path(self) -> Path:
@@ -71,36 +76,15 @@ class CascadePipeline:
         write_jsonl(self.graphrag_path, (retriever.rank(instance) for instance in self.adapter.iter_instances(limit)))
         return self.graphrag_path
 
-    def _build_neural_reranker(self) -> NeuralReranker:
-        ranker_config = self.config.get("ranker", {})
-        feature_builder = RankerFeatureBuilder(self.embedder)
-        if ranker_config.get("model", "mlp") != "mlp":
-            raise ValueError("Only the mlp ranker is included in this release")
-        model = MLPRanker(feature_builder.dimension, int(ranker_config.get("hidden_dim", 256)), float(ranker_config.get("dropout", 0.1)))
-        checkpoint = ranker_config.get("checkpoint")
-        # After train.py, reuse the checkpoint in the current experiment even
-        # when the YAML intentionally leaves ranker.checkpoint as null.
-        if not checkpoint:
-            default_checkpoint = self.output_dir / "ranker.pt"
-            if default_checkpoint.exists():
-                checkpoint = str(default_checkpoint)
-        if checkpoint:
-            if not Path(checkpoint).exists():
-                raise FileNotFoundError(f"Ranker checkpoint not found: {checkpoint}")
-            load_checkpoint(model, checkpoint, ranker_config.get("device", "cpu"))
-        return NeuralReranker(
-            model,
-            feature_builder,
-            top_k=int(ranker_config.get("top_k", 20)),
-            device=ranker_config.get("device", "cpu"),
-            representation_output_dim=int(ranker_config.get("representation_output_dim", 16)),
-        )
-
     def run_neural(self) -> Path:
         if not self.graphrag_path.exists():
             raise FileNotFoundError(f"Run the GraphRAG stage first: {self.graphrag_path}")
-        reranker = self._build_neural_reranker()
-        write_jsonl(self.neural_path, (reranker.rank(result) for result in iter_results(self.graphrag_path)))
+        manifest = self.config.get("ranker_dataset", {}).get("manifest")
+        if not manifest:
+            raise ValueError("Neural inference requires ranker_dataset.manifest; run prepare_ranker_dataset.py first")
+        if not Path(manifest).exists():
+            raise FileNotFoundError(f"Ranker tensor manifest not found: {manifest}. Run prepare_ranker_dataset.py first")
+        write_jsonl(self.neural_path, iter_tensor_rankings(self.config))
         return self.neural_path
 
     def run_llm(self) -> Path:

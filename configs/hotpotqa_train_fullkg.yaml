@@ -22,17 +22,40 @@ retrieval:
 
 ranker:
   top_k: 20
-  model: mlp
+  model: set_transformer
   hidden_dim: 256
+  num_heads: 8
+  num_layers: 3
+  feedforward_dim: 1024
   dropout: 0.1
-  device: cpu
+  device: cuda
   representation_output_dim: 16
   checkpoint: null
 
+ranker_dataset:
+  graphrag_path: outputs/hotpotqa/hotpot_train_fullkg_graphrag/graphrag.jsonl
+  output_dir: outputs/hotpotqa/hotpot_train_fullkg_graphrag/ranker_dataset
+  manifest: outputs/hotpotqa/hotpot_train_fullkg_graphrag/ranker_dataset/manifest.json
+  candidate_k: 100
+  shard_size: 512
+  storage_dtype: float16
+  validation_fraction: 0.1
+  split_seed: 13
+
 training:
   epochs: 100
-  learning_rate: 0.001
+  batch_size: 256
+  learning_rate: 0.0001
+  weight_decay: 0.01
   seed: 13
+  loss: listwise
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  amp: true
+  amp_dtype: bfloat16
+  max_grad_norm: 1.0
+  checkpoint_dir: outputs/hotpotqa/hotpot_train_fullkg_graphrag/ranker_checkpoints
 
 llm:
   provider: passthrough
@@ -43,7 +66,7 @@ llm:
   max_text_chars: 4000
 
 evaluation:
-  ks: [5, 10, 20, 100]
+  ks: [5, 10]
 
 output:
   root: outputs

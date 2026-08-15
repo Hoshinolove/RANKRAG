@@ -34,10 +34,27 @@ ranker:
   representation_output_dim: 16
   checkpoint: null
 
+ranker_dataset:
+  graphrag_path: outputs/hotpotqa/hashing_baseline/graphrag.jsonl
+  output_dir: outputs/hotpotqa/hashing_baseline/ranker_dataset
+  manifest: outputs/hotpotqa/hashing_baseline/ranker_dataset/manifest.json
+  candidate_k: 100
+  shard_size: 512
+  storage_dtype: float16
+  validation_fraction: 0.1
+  split_seed: 13
+
 training:
   epochs: 3
+  batch_size: 64
   learning_rate: 0.001
   seed: 13
+  loss: pointwise
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  amp: false
+  checkpoint_dir: outputs/hotpotqa/hashing_baseline/ranker_checkpoints
 
 llm:
   # passthrough is the deterministic offline baseline. For Qwen/DeepSeek/OpenAI
@@ -51,7 +68,7 @@ llm:
   api_key_env: OPENAI_API_KEY
 
 evaluation:
-  ks: [5, 10, 20, 100]
+  ks: [5, 10]
 
 output:
   root: outputs

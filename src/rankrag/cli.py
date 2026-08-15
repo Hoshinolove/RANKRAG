@@ -2,15 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 
-from rankrag.embedding import create_embedder
-from rankrag.evaluation.evaluator import evaluate_results
-from rankrag.io import iter_results, load_config, write_json
+from rankrag.io import load_config
 from rankrag.pipeline.recommender import CascadePipeline
-from rankrag.ranker.features import RankerFeatureBuilder
-from rankrag.ranker.mlp import MLPRanker
-from rankrag.ranker.training import set_seed, train_mlp
+from rankrag.ranker.preprocessing import prepare_ranker_dataset
+from rankrag.ranker.trainer import train_tensor_ranker
 
 
 def pipeline_main() -> None:
@@ -39,31 +35,21 @@ def pipeline_main() -> None:
 
 
 def train_main() -> None:
-    parser = argparse.ArgumentParser(description="Train the MLP neural ranker")
+    parser = argparse.ArgumentParser(description="Train a neural ranker from precomputed tensor shards")
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     config = load_config(args.config)
-    pipeline = CascadePipeline(config, args.config)
-    if not pipeline.graphrag_path.exists():
-        raise FileNotFoundError(f"Missing cached GraphRAG results: {pipeline.graphrag_path}")
-    ranker_config = config.get("ranker", {})
-    training = config.get("training", {})
-    seed = int(training.get("seed", 13))
-    set_seed(seed)
-    feature_builder = RankerFeatureBuilder(create_embedder(config.get("embedding", {})))
-    model = MLPRanker(feature_builder.dimension, int(ranker_config.get("hidden_dim", 256)), float(ranker_config.get("dropout", 0.1)))
-    checkpoint = ranker_config.get("checkpoint") or str(pipeline.output_dir / "ranker.pt")
-    summary = train_mlp(
-        model,
-        feature_builder,
-        lambda: iter_results(pipeline.graphrag_path),
-        checkpoint,
-        epochs=int(training.get("epochs", 3)),
-        learning_rate=float(training.get("learning_rate", 1e-3)),
-        device=ranker_config.get("device", "cpu"),
-        seed=seed,
-    )
-    print(json.dumps({"checkpoint": checkpoint, **summary}, indent=2))
+    if not config.get("ranker_dataset", {}).get("manifest"):
+        raise ValueError("ranker_dataset.manifest is required; run prepare_ranker_dataset.py first")
+    print(json.dumps(train_tensor_ranker(config), ensure_ascii=False, indent=2))
+
+
+def prepare_ranker_dataset_main() -> None:
+    parser = argparse.ArgumentParser(description="Precompute ranker features into tensor shards")
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+    manifest = prepare_ranker_dataset(load_config(args.config))
+    print(json.dumps({"manifest": str(manifest)}, ensure_ascii=False, indent=2))
 
 
 def evaluate_main() -> None:
