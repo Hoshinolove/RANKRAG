@@ -1,4 +1,4 @@
-from pathlib import Path
+import json
 
 from rankrag.io import iter_results
 from rankrag.pipeline.recommender import CascadePipeline
@@ -6,7 +6,7 @@ from rankrag.ranker.preprocessing import prepare_ranker_dataset
 from rankrag.ranker.trainer import train_tensor_ranker
 
 
-def test_all_stages_are_independently_persisted(tmp_path):
+def test_validation_inference_excludes_train_queries_and_stages_persist(tmp_path):
     config = {
         "dataset": {"name": "hotpotqa", "path": "tests/fixtures/hotpot_tiny.json"},
         "embedding": {"backend": "hashing", "dimension": 64},
@@ -52,13 +52,26 @@ def test_all_stages_are_independently_persisted(tmp_path):
     }
     prepare_ranker_dataset(config)
     train_tensor_ranker(config)
-    pipeline.run_neural()
+    pipeline.run_neural(split="validation")
     pipeline.run_llm()
     metrics = pipeline.evaluate()
     assert set(metrics) == {"graphrag", "neural", "llm"}
     assert len(list(iter_results(pipeline.graphrag_path))) == 2
-    assert len(list(iter_results(pipeline.neural_path))) == 2
+    manifest = json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8"))
+    validation_ids = {
+        json.loads(line)["query_id"]
+        for shard in manifest["splits"]["validation"]["shards"]
+        for line in (dataset_dir / shard["metadata"]).read_text(encoding="utf-8").splitlines()
+    }
+    train_ids = {
+        json.loads(line)["query_id"]
+        for shard in manifest["splits"]["train"]["shards"]
+        for line in (dataset_dir / shard["metadata"]).read_text(encoding="utf-8").splitlines()
+    }
+    neural_results = list(iter_results(pipeline.neural_path))
+    assert {result.query_id for result in neural_results} == validation_ids
+    assert not ({result.query_id for result in neural_results} & train_ids)
     llm_results = list(iter_results(pipeline.llm_path))
-    assert len(llm_results) == 2
+    assert len(llm_results) == len(validation_ids)
     assert all(result.metadata["llm_cache_key"] for result in llm_results)
     assert (pipeline.output_dir / "metrics.json").exists()

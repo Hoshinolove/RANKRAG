@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from rankrag.data.paragraph_corpus import ParagraphCorpus
 from rankrag.embedding import create_embedder
 from rankrag.io import iter_results, write_json
 from rankrag.ranker.features import RankerFeatureBuilder
@@ -85,13 +86,31 @@ def prepare_ranker_dataset(config: dict[str, Any]) -> Path:
     storage_dtype_name = dataset_config.get("storage_dtype", "float16")
     storage_dtype = {"float16": torch.float16, "float32": torch.float32}[storage_dtype_name]
     feature_builder = RankerFeatureBuilder(create_embedder(config.get("embedding", {})))
+    global_config = config.get("global_retrieval", {})
+    corpus = None
+    corpus_embeddings = None
+    if global_config.get("enabled", False):
+        asset_dir = Path(global_config.get("asset_dir", "outputs/global_retrieval"))
+        corpus_path = Path(global_config.get("corpus_path", asset_dir / "corpus.jsonl"))
+        embeddings_path = Path(global_config.get("embeddings_path", asset_dir / "paragraph_embeddings.npy"))
+        corpus = ParagraphCorpus.load(corpus_path)
+        corpus_embeddings = np.load(embeddings_path, mmap_mode="r")
+        if corpus_embeddings.shape != (len(corpus), feature_builder.embedder.dimension):
+            raise ValueError("Offline corpus embeddings do not match the ranker embedder")
     writers = {
         split: _ShardWriter(output_dir, split, shard_size, storage_dtype)
         for split in ("train", "validation")
     }
     total = skipped_no_positive = truncated = 0
     for result in iter_results(graph_path):
-        raw_features = feature_builder.build(result)
+        candidate_embeddings = None
+        if corpus is not None and corpus_embeddings is not None:
+            try:
+                rows = [corpus.id_to_row[candidate.candidate_id] for candidate in result.candidates]
+            except KeyError as exc:
+                raise KeyError(f"GraphRAG candidate is missing from the global paragraph corpus: {exc.args[0]}") from exc
+            candidate_embeddings = np.asarray(corpus_embeddings[rows])
+        raw_features = feature_builder.build(result, candidate_embeddings=candidate_embeddings)
         valid_count = min(candidate_k, len(result.candidates))
         if len(result.candidates) > candidate_k:
             truncated += 1
@@ -138,4 +157,7 @@ def prepare_ranker_dataset(config: dict[str, Any]) -> Path:
     }
     manifest_path = output_dir / "manifest.json"
     write_json(manifest_path, manifest)
+    mmap = getattr(corpus_embeddings, "_mmap", None)
+    if mmap is not None:
+        mmap.close()
     return manifest_path

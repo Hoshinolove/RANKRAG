@@ -14,20 +14,22 @@ def pipeline_main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--stage", choices=["all", "graphrag", "neural", "llm"], default="all")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--split", help="Tensor inference split (default: ranker.inference_split or validation)")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
     pipeline = CascadePipeline(config, args.config)
     stages = ["graphrag", "neural", "llm"] if args.stage == "all" else [args.stage]
     for stage in stages:
-        output_path = getattr(pipeline, f"{stage}_path")
+        inference_split = args.split or str(config.get("ranker", {}).get("inference_split", "validation"))
+        output_path = pipeline.neural_split_path(inference_split) if stage == "neural" else getattr(pipeline, f"{stage}_path")
         if output_path.exists() and not args.force:
             print(f"Reusing {stage}: {output_path}")
             continue
         if stage == "graphrag":
             pipeline.run_graphrag(args.limit)
         elif stage == "neural":
-            pipeline.run_neural()
+            pipeline.run_neural(split=inference_split)
         else:
             pipeline.run_llm()
         print(f"Wrote {stage}: {output_path}")

@@ -40,6 +40,9 @@ class RankingMetricAccumulator:
         for row in range(scores.shape[0]):
             valid_count = int(mask[row].sum())
             positives = float(labels[row, :valid_count].sum())
+            # Match evaluation/evaluator.py: every query contributes to the
+            # denominator. A query with no retrieved positive contributes zero.
+            self.count += 1
             if not valid_count or not positives:
                 continue
             order = torch.argsort(scores[row, :valid_count], descending=True)
@@ -57,7 +60,6 @@ class RankingMetricAccumulator:
                 ideal_count = min(cutoff, int(positives))
                 idcg = float(discounts[:ideal_count].sum())
                 self.totals[f"NDCG@{k}"] += dcg / idcg if idcg else 0.0
-            self.count += 1
 
     def compute(self) -> dict[str, float | int]:
         metrics: dict[str, float | int] = {

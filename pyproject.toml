@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Dataset-agnostic GraphRAG cascade ranking research framework"
 requires-python = ">=3.10"
 dependencies = [
+  "faiss-cpu>=1.8",
   "networkx>=3.0",
   "numpy>=1.24",
   "PyYAML>=6.0",

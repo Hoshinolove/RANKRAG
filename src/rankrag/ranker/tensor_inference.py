@@ -38,9 +38,15 @@ def _checkpoint_path(config: dict[str, Any]) -> Path:
     return best if best.exists() else checkpoint_dir / "last.pt"
 
 
-def iter_tensor_rankings(config: dict[str, Any]) -> Iterator[RankingResult]:
+def iter_tensor_rankings(
+    config: dict[str, Any],
+    split: str = "validation",
+) -> Iterator[RankingResult]:
     dataset_config = config["ranker_dataset"]
     manifest = load_manifest(dataset_config["manifest"])
+    if split not in manifest["splits"]:
+        available = ", ".join(sorted(manifest["splits"]))
+        raise ValueError(f"Unknown ranker inference split {split!r}; available splits: {available}")
     graph_path = Path(manifest["source_graphrag"])
     checkpoint_path = _checkpoint_path(config)
     if not checkpoint_path.exists():
@@ -61,47 +67,51 @@ def iter_tensor_rankings(config: dict[str, Any]) -> Iterator[RankingResult]:
     amp_dtype = torch.bfloat16 if config.get("training", {}).get("amp_dtype", "bfloat16") == "bfloat16" else torch.float16
     offsets = _build_query_offsets(graph_path)
     with graph_path.open("rb") as graph_handle, torch.inference_mode():
-        for split in ("train", "validation"):
-            for shard_info in manifest["splits"][split]["shards"]:
-                shard = torch.load(resolve_shard_path(manifest, shard_info["tensor"]), map_location="cpu", weights_only=True)
-                metadata_path = resolve_shard_path(manifest, shard_info["metadata"])
-                with metadata_path.open("r", encoding="utf-8") as metadata_handle:
-                    metadata = [json.loads(line) for line in metadata_handle]
-                for start in range(0, len(metadata), batch_size):
-                    end = min(start + batch_size, len(metadata))
-                    features = shard["features"][start:end].to(device)
-                    mask = shard["mask"][start:end].to(device)
-                    if not amp:
-                        features = features.float()
-                    context = torch.autocast("cuda", dtype=amp_dtype) if amp else torch.autocast("cpu", enabled=False)
-                    with context:
-                        scores, representations = model(features, mask)
-                    scores = scores.float().cpu()
-                    representations = representations.float().cpu()
-                    for row, item in enumerate(metadata[start:end]):
-                        query_id = str(item["query_id"])
-                        if query_id not in offsets:
-                            raise KeyError(f"Query {query_id} is missing from GraphRAG cache")
-                        result = _read_result_at(graph_handle, offsets[query_id])
-                        candidate_ids = list(item["candidate_ids"])
-                        candidates_by_id = {candidate.candidate_id: candidate for candidate in result.candidates}
-                        candidates = []
-                        for candidate_index, candidate_id in enumerate(candidate_ids):
-                            candidate = candidates_by_id[candidate_id]
-                            candidate.neural_score = float(scores[row, candidate_index])
-                            candidate.intermediate_representation = [
-                                float(value) for value in representations[row, candidate_index, :representation_dim]
-                            ]
-                            candidates.append(candidate)
-                        candidates.sort(key=lambda candidate: (-float(candidate.neural_score), candidate.candidate_id))
-                        candidates = candidates[: min(top_k, len(candidates))]
-                        for rank, candidate in enumerate(candidates, start=1):
-                            candidate.neural_rank = rank
-                        yield RankingResult(
-                            query_id=result.query_id,
-                            query_text=result.query_text,
-                            positive_ids=result.positive_ids,
-                            candidates=candidates,
-                            stage="neural",
-                            metadata={**result.metadata, "ranker_checkpoint": str(checkpoint_path), "ranker_dataset": dataset_config["manifest"]},
-                        )
+        for shard_info in manifest["splits"][split]["shards"]:
+            shard = torch.load(resolve_shard_path(manifest, shard_info["tensor"]), map_location="cpu", weights_only=True)
+            metadata_path = resolve_shard_path(manifest, shard_info["metadata"])
+            with metadata_path.open("r", encoding="utf-8") as metadata_handle:
+                metadata = [json.loads(line) for line in metadata_handle]
+            for start in range(0, len(metadata), batch_size):
+                end = min(start + batch_size, len(metadata))
+                features = shard["features"][start:end].to(device)
+                mask = shard["mask"][start:end].to(device)
+                if not amp:
+                    features = features.float()
+                context = torch.autocast("cuda", dtype=amp_dtype) if amp else torch.autocast("cpu", enabled=False)
+                with context:
+                    scores, representations = model(features, mask)
+                scores = scores.float().cpu()
+                representations = representations.float().cpu()
+                for row, item in enumerate(metadata[start:end]):
+                    query_id = str(item["query_id"])
+                    if query_id not in offsets:
+                        raise KeyError(f"Query {query_id} is missing from GraphRAG cache")
+                    result = _read_result_at(graph_handle, offsets[query_id])
+                    candidate_ids = list(item["candidate_ids"])
+                    candidates_by_id = {candidate.candidate_id: candidate for candidate in result.candidates}
+                    candidates = []
+                    for candidate_index, candidate_id in enumerate(candidate_ids):
+                        candidate = candidates_by_id[candidate_id]
+                        candidate.neural_score = float(scores[row, candidate_index])
+                        candidate.intermediate_representation = [
+                            float(value) for value in representations[row, candidate_index, :representation_dim]
+                        ]
+                        candidates.append(candidate)
+                    candidates.sort(key=lambda candidate: (-float(candidate.neural_score), candidate.candidate_id))
+                    candidates = candidates[: min(top_k, len(candidates))]
+                    for rank, candidate in enumerate(candidates, start=1):
+                        candidate.neural_rank = rank
+                    yield RankingResult(
+                        query_id=result.query_id,
+                        query_text=result.query_text,
+                        positive_ids=result.positive_ids,
+                        candidates=candidates,
+                        stage="neural",
+                        metadata={
+                            **result.metadata,
+                            "ranker_checkpoint": str(checkpoint_path),
+                            "ranker_dataset": dataset_config["manifest"],
+                            "ranker_split": split,
+                        },
+                    )

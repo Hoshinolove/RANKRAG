@@ -1,4 +1,4 @@
-# 使用 GLiNER + REBEL 生成的训练集完整 KG。
+# 使用 GLiNER + REBEL 生成的训练集完整 KG 和全局段落候选库。
 dataset:
   name: hotpotqa
   path: data/hotpot_train.json
@@ -8,9 +8,30 @@ graph:
   lexical_fallback: false
 
 embedding:
-  backend: hashing
-  dimension: 256
-  ngrams: 2
+  backend: sentence_transformer
+  model: BAAI/bge-base-en-v1.5
+  device: cuda
+
+global_retrieval:
+  enabled: true
+  corpus_inputs:
+    - data/hotpot_train_paragraphs.json
+  asset_dir: outputs/hotpotqa_global_assets/train
+  corpus_path: outputs/hotpotqa_global_assets/train/corpus.jsonl
+  embeddings_path: outputs/hotpotqa_global_assets/train/paragraph_embeddings.npy
+  faiss_index_path: outputs/hotpotqa_global_assets/train/paragraphs.faiss
+  graph_index_path: outputs/hotpotqa_global_assets/train/global_graph.sqlite
+  manifest_path: outputs/hotpotqa_global_assets/train/manifest.json
+  index_backend: faiss
+  embedding_batch_size: 256
+  semantic_top_k: 500
+  seed_paragraph_k: 20
+  graph_hops: 2
+  max_graph_candidates: 1000
+  max_entities_per_hop: 500
+  max_relations_per_entity: 100
+  max_paragraphs_per_entity: 100
+  max_paths_per_candidate: 3
 
 retrieval:
   top_k: 100
@@ -31,11 +52,12 @@ ranker:
   device: cuda
   representation_output_dim: 16
   checkpoint: null
+  inference_split: validation
 
 ranker_dataset:
-  graphrag_path: outputs/hotpotqa/hotpot_train_fullkg_graphrag/graphrag.jsonl
-  output_dir: outputs/hotpotqa/hotpot_train_fullkg_graphrag/ranker_dataset
-  manifest: outputs/hotpotqa/hotpot_train_fullkg_graphrag/ranker_dataset/manifest.json
+  graphrag_path: outputs/hotpotqa/hotpot_train_global_graphrag/graphrag.jsonl
+  output_dir: outputs/hotpotqa/hotpot_train_global_graphrag/ranker_dataset
+  manifest: outputs/hotpotqa/hotpot_train_global_graphrag/ranker_dataset/manifest.json
   candidate_k: 100
   shard_size: 512
   storage_dtype: float16
@@ -55,7 +77,7 @@ training:
   amp: true
   amp_dtype: bfloat16
   max_grad_norm: 1.0
-  checkpoint_dir: outputs/hotpotqa/hotpot_train_fullkg_graphrag/ranker_checkpoints
+  checkpoint_dir: outputs/hotpotqa/hotpot_train_global_graphrag/ranker_checkpoints
 
 llm:
   provider: passthrough
@@ -70,4 +92,4 @@ evaluation:
 
 output:
   root: outputs
-  experiment: hotpot_train_fullkg_graphrag
+  experiment: hotpot_train_global_graphrag

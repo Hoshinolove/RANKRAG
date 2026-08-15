@@ -1,153 +1,146 @@
-# Neural Ranker 训练与推理操作手册
+# Candidate Set Transformer 训练与推理手册
 
-这份手册假设你已经完成训练集完整 KG 和 GraphRAG。它只负责 Neural Ranker，不需要你修改 Python 代码。
+本文档从已经生成全局 GraphRAG 结果开始。完整 GraphRAG 命令见 `RUN_GLOBAL_GRAPHRAG_CN.md`。
 
-当前 Neural Ranker 是一个可训练的 PyTorch MLP baseline，训练流程是：
-
-```text
-GraphRAG graphrag.jsonl
-        -> 读取 query、candidate、语义分、图分、路径特征
-        -> MLP + pointwise BCE loss
-        -> 保存 ranker.pt
-        -> Neural Ranker 重新排序
-        -> 输出 neural.jsonl
-        -> 评估 Recall / NDCG / MRR / Hit@K
-```
-
-当前版本已经具备独立模型接口、独立训练入口、checkpoint 保存/加载和独立评估。它是研究 baseline，不是最终的 Transformer/GNN 模型：当前没有验证集 early stopping，默认使用 pointwise BCE，并在训练集缓存上训练和评估。后续可以在不改变流水线接口的情况下替换模型和 loss。
-
-## 0. 进入项目目录
+## 1. 检查 GraphRAG
 
 ```bash
-# 替换成你的真实项目路径
 cd /data/11rankRAG/code
-
-# 如果使用了虚拟环境，先激活
 source .venv/bin/activate
+test -f outputs/hotpotqa/hotpot_train_global_graphrag/graphrag.jsonl \
+  && echo "GraphRAG：存在" || echo "GraphRAG：缺失"
+wc -l outputs/hotpotqa/hotpot_train_global_graphrag/graphrag.jsonl
 ```
 
-## 1. 检查 GraphRAG 是否完成
+完整训练问题结果应为 90,447 行。
 
-Neural Ranker 不能直接读取原始段落，必须先读取 GraphRAG 缓存：
+## 2. 一次性生成 Tensor 分片
 
 ```bash
-# 检查 GraphRAG 输出文件
-test -f outputs/hotpotqa/hotpot_train_fullkg_graphrag/graphrag.jsonl \
-  && echo "GraphRAG file: OK" \
-  || echo "GraphRAG file: MISSING"
-
-# 检查问题数量，完整训练集预期为 90,447 行
-wc -l outputs/hotpotqa/hotpot_train_fullkg_graphrag/graphrag.jsonl
+python prepare_ranker_dataset.py --config configs/hotpotqa_train_fullkg.yaml
 ```
 
-如果文件不存在，先回到 [RUN_TRAIN_KG_CN.md](E:/11rankRAG/code/RUN_TRAIN_KG_CN.md)，完成 KG 合并和 GraphRAG。
-
-## 2. 确认配置
-
-本手册使用：
+输出结构：
 
 ```text
-configs/hotpotqa_train_fullkg.yaml
+ranker_dataset/
+├── manifest.json
+├── train/
+│   ├── shard-00000.pt
+│   └── shard-00000.jsonl
+└── validation/
+    ├── shard-00000.pt
+    └── shard-00000.jsonl
 ```
 
-默认训练参数是：
+`.pt` 保存 `[query, candidate, feature]` Tensor、label 和 mask；`.jsonl` sidecar 保存 query ID 与 candidate ID。全局配置会按 paragraph ID 直接复用离线 corpus embedding，不会再次编码 Top100 段落。训练 100 epoch 时只读取 Tensor，不执行 embedding、图遍历或 JSON 特征构建。
 
-```yaml
-ranker:
-  model: mlp
-  hidden_dim: 256
-  top_k: 20
+检查 split：
 
-training:
-  epochs: 3
-  learning_rate: 0.001
-  seed: 13
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("outputs/hotpotqa/hotpot_train_global_graphrag/ranker_dataset/manifest.json")
+m = json.loads(path.read_text(encoding="utf-8"))
+print("train =", m["splits"]["train"]["count"])
+print("validation =", m["splits"]["validation"]["count"])
+print("GraphRAG Top100 无 positive =", m["statistics"]["queries_without_positive_in_top_k"])
+PY
 ```
 
-第一次运行不需要修改配置。
+`split_seed: 13` 表示用固定种子 13 根据 query ID 做可复现的 train/validation 划分。它不是第 13 条数据，也不是训练轮数。相同数据、query ID 和 seed 会得到相同 split。
 
 ## 3. 训练 Neural Ranker
 
 ```bash
-# 使用 GraphRAG 缓存训练 MLP Ranker
-python train.py \
-  --config configs/hotpotqa_train_fullkg.yaml
+python train.py --config configs/hotpotqa_train_fullkg.yaml
 ```
 
-训练完成后应该看到类似输出：
+正式模型保持不变：
 
 ```text
-{
-  "checkpoint": "outputs/hotpotqa/hotpot_train_fullkg_graphrag/ranker.pt",
-  "mean_training_loss": 0.8,
-  "updates": 271341.0,
-  "epochs": 3.0
-}
+[B,K,D]
+ -> Linear projection
+ -> 3 层 TransformerEncoder（8 heads）
+ -> candidate scores
+ -> listwise ranking loss
 ```
 
-实际 loss 和 updates 会因数据、GPU、配置而不同。
+默认使用 100 epochs、batch size 256、CUDA BF16 和 8 个 DataLoader worker。所有 worker 在同一 epoch 使用统一 shard permutation，再按 `worker_id::num_workers` 分配；worker 内样本可以独立打乱。
 
-checkpoint 文件是：
-
-```text
-outputs/hotpotqa/hotpot_train_fullkg_graphrag/ranker.pt
-```
-
-## 4. 使用训练好的模型生成 Neural 结果
-
-不需要手工把 checkpoint 路径写入 YAML。程序会自动发现当前实验目录下的 `ranker.pt`：
+后台训练：
 
 ```bash
-# 读取 graphrag.jsonl，加载刚才训练的 ranker.pt，输出 neural.jsonl
+mkdir -p logs
+nohup python train.py \
+  --config configs/hotpotqa_train_fullkg.yaml \
+  > logs/neural_train.log 2>&1 &
+echo $!
+tail -f logs/neural_train.log
+```
+
+输出：
+
+```text
+outputs/hotpotqa/hotpot_train_global_graphrag/ranker_checkpoints/best.pt
+outputs/hotpotqa/hotpot_train_global_graphrag/ranker_checkpoints/last.pt
+outputs/hotpotqa/hotpot_train_global_graphrag/ranker_checkpoints/training_log.jsonl
+```
+
+`best.pt` 按 validation NDCG@10 选择。GraphRAG Top-K 没有 positive 的 validation query 不会被跳过：Recall、NDCG、Hit、MRR 均贡献 0，并进入 query 总数。
+
+## 4. 只对 validation 推理
+
+```bash
 python run_pipeline.py \
   --config configs/hotpotqa_train_fullkg.yaml \
   --stage neural \
+  --split validation \
   --force
 ```
 
-输出文件：
+标准输出：
 
 ```text
-outputs/hotpotqa/hotpot_train_fullkg_graphrag/neural.jsonl
+outputs/hotpotqa/hotpot_train_global_graphrag/neural.jsonl
 ```
 
-每个 candidate 会保留：
+该文件只包含 validation query，绝不混入 train query。配置默认也是：
 
-- `candidate_id`
-- 原始 `rag_score`
-- `semantic_score`
-- `graph_score`
-- `neural_score`
-- `neural_rank`
-- 图证据和路径
-- 中间表示 `intermediate_representation`
+```yaml
+ranker:
+  inference_split: validation
+```
 
-## 5. 评估 Neural Ranker
+只有明确做训练集诊断时才运行：
 
 ```bash
-# 只评估 Neural 阶段
+python run_pipeline.py \
+  --config configs/hotpotqa_train_fullkg.yaml \
+  --stage neural \
+  --split train \
+  --force
+```
+
+训练集结果写入 `neural.train.jsonl`，不会覆盖 validation 的 `neural.jsonl`。推理支持 manifest 中存在的任意 split 名称，因此以后增加独立 `test` 或 `dev` split 时无需修改 Neural 核心接口。
+
+## 5. 评估 validation
+
+```bash
 python evaluate.py \
   --config configs/hotpotqa_train_fullkg.yaml \
   --stage neural
 ```
 
-也可以同时查看 GraphRAG 和 Neural：
-
-```bash
-python evaluate.py \
-  --config configs/hotpotqa_train_fullkg.yaml \
-  --stage all
-```
-
-指标文件：
+指标为 Recall@5、Recall@10、NDCG@5、NDCG@10、MRR、Hit@5、Hit@10，写入：
 
 ```text
-outputs/hotpotqa/hotpot_train_fullkg_graphrag/metrics.json
+outputs/hotpotqa/hotpot_train_global_graphrag/metrics.json
 ```
 
-## 6. 继续运行 LLM Reranker（可选）
-
-Neural 结果完成后，才可以运行 LLM 阶段：
+## 6. LLM Top20 到 Top10
 
 ```bash
 python run_pipeline.py \
@@ -156,104 +149,47 @@ python run_pipeline.py \
   --force
 ```
 
-默认配置使用 offline passthrough provider，不会调用真实 API。如果要使用真实 LLM，需要在 YAML 中配置 `openai_compatible` provider 和 API key 环境变量。
+LLM 默认读取 validation 的 `neural.jsonl`，GraphRAG、Neural 和 LLM 核心输出接口没有改变。
 
-## 7. 修改训练参数
+## 7. 显存不足
 
-编辑配置：
-
-```bash
-nano configs/hotpotqa_train_fullkg.yaml
-```
-
-例如训练 5 轮：
+先把 batch size 改为 128 或 64：
 
 ```yaml
 training:
-  epochs: 5
-  learning_rate: 0.001
-  seed: 13
+  batch_size: 128
 ```
 
-修改后重新训练：
-
-```bash
-python train.py --config configs/hotpotqa_train_fullkg.yaml
-python run_pipeline.py --config configs/hotpotqa_train_fullkg.yaml --stage neural --force
-python evaluate.py --config configs/hotpotqa_train_fullkg.yaml --stage neural
-```
-
-## 8. 常见错误
-
-### 找不到 GraphRAG 文件
-
-错误类似：
-
-```text
-Missing cached GraphRAG results
-```
-
-说明还没有完成 GraphRAG，先执行：
-
-```bash
-python run_pipeline.py \
-  --config configs/hotpotqa_train_fullkg.yaml \
-  --stage graphrag \
-  --force
-```
-
-### Neural 结果没有变化
-
-确认你在训练后使用了 `--force`：
-
-```bash
-python run_pipeline.py \
-  --config configs/hotpotqa_train_fullkg.yaml \
-  --stage neural \
-  --force
-```
-
-不加 `--force` 时，如果 `neural.jsonl` 已存在，程序会直接复用旧文件。
-
-### 显存不足
-
-当前默认 Neural Ranker 使用 CPU：
+仍不足时再缩小模型：
 
 ```yaml
 ranker:
-  device: cpu
+  hidden_dim: 128
+  num_heads: 4
+  num_layers: 2
+  feedforward_dim: 512
 ```
 
-如果远程机器需要 GPU，可改为：
+修改模型结构后必须重新训练，但无需重新运行 GraphRAG，也无需重新生成 Tensor。
 
-```yaml
-ranker:
-  device: cuda
-```
-
-但当前 MLP 特征维度不大，CPU 也可以运行；训练数据很多时主要瓶颈是 JSONL 读取和文本 embedding。
-
-### 为什么 Top-20 结果少于 20 条
-
-HotpotQA 每个问题原始候选通常只有 2 到 10 个。代码会使用：
-
-```python
-k = min(configured_k, len(candidates))
-```
-
-因此不会复制候选，结果少于 20 是正确行为。
-
-## 9. 完整命令顺序
-
-如果 KG 和 GraphRAG 已经完成，直接按下面三条执行：
+## 8. 最短可复制流程
 
 ```bash
-# 训练
+# 1. 全局段落、embedding、FAISS 和 KG 索引，只构建一次
+python prepare_global_retrieval.py --config configs/hotpotqa_train_fullkg.yaml --stage all
+
+# 2. 真正全局 GraphRAG Top100
+python run_pipeline.py --config configs/hotpotqa_train_fullkg.yaml --stage graphrag --force
+
+# 3. GraphRAG 转 Tensor，只执行一次
+python prepare_ranker_dataset.py --config configs/hotpotqa_train_fullkg.yaml
+
+# 4. 训练 Candidate Set Transformer
 python train.py --config configs/hotpotqa_train_fullkg.yaml
 
-# 推理并生成 Top-20
-python run_pipeline.py --config configs/hotpotqa_train_fullkg.yaml --stage neural --force
+# 5. 只推理 validation
+python run_pipeline.py --config configs/hotpotqa_train_fullkg.yaml --stage neural --split validation --force
 
-# 评估
+# 6. 评估 validation
 python evaluate.py --config configs/hotpotqa_train_fullkg.yaml --stage neural
 ```

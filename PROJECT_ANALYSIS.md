@@ -1,73 +1,51 @@
-# 当前项目结构与数据分析
+# 项目现状分析
 
-## 现有目录
+## 数据口径
 
-### 可复用数据
+- `hotpot_train.json`：90,447 个训练问题。
+- `hotpot_train_paragraphs.json`：483,696 条训练段落记录，是全局候选 corpus 来源。
+- `outputs/kg_train_gliner_rebel/kg_extractions.jsonl`：完整运行后应为 483,696 行，是正式全局 KG 来源。
+- `hotpot_dev_subset.json` 的 7,405 只是旧开发子集，不是训练集。
+- `data/kg_extractions.jsonl` 的 66,635 行属于旧开发段落 KG，正式训练配置可以搁置。
 
-- `data/hotpot_dev_subset.json`：7,405 条 HotpotQA 开发子集问题。本文件中的样本均为 `hard`；每个问题最多有 10 个段落候选，平均约 9.95 个。
-- `data/hotpot_train.json`：90,447 条训练问题。文件较大，项目 Adapter 采用顶层 JSON 数组流式解析，不会一次性读入内存。
-- `data/hotpot_paragraphs.json`：66,635 个段落。它与 `data/kg_extractions.jsonl` 的记录数一致，是目前最完整的“段落 + KG 抽取”数据。
-- `data/hotpot_train_paragraphs.json`：483,696 条训练段落记录，去重后 481,959 个标题。它可以用于后续训练或候选池实验，但当前目录没有与之对应的完整 KG 抽取结果。
-- `data/kg_extractions.jsonl`：66,635 行，按首实体名去重后约 63,445 个标题，每行包含段落实体和关系。与训练段落标题的交集为 33,009 个，约覆盖训练段落唯一标题的 6.85%。运行 GraphRAG 时先收集当前候选标题，再流式扫描该文件，只把相关记录建立到局部图中。
+## GraphRAG
 
-### 已有上游代码和存储
+旧实现只在每个 HotpotQA query 自带的 2–10 个 context 段落中排序，不能产生真正 Top100。当前正式配置已改为全局检索：
 
-- `hotpot-master/`：2019 年 HotpotQA 问答模型代码，输出假设是 QA 答案，不是通用段落排序结果，因此没有直接嵌入 RankRAG 核心流程。
-- `graphrag-main/`：Microsoft GraphRAG 完整上游仓库。它适合参考和后续替换底层能力，本项目没有对其进行大规模重构。
-- `rag_storage/graph_chunk_entity_relation.graphml`：已有 LightRAG NetworkX 图，约 177 MB。第一版按题目建立局部图，避免每个 query 都加载整张图。
-- `rag_storage/vdb_entities.json`、`vdb_relationships.json`、`vdb_chunks.json`：已有压缩向量存储，体积达到 GB 级。第一版使用离线 hashing embedder，避免把这些 JSON 向量整体载入本地内存；后续可封装为 FAISS 或其他 VectorStore。
+1. 全局段落按稳定 SHA1 ID 去重；
+2. 全部段落 embedding 和 FAISS index 离线构建；
+3. GLiNER + REBEL 结果离线构建段落-实体、实体-段落和实体关系索引；
+4. query 做 semantic Top500；
+5. 从 seed paragraph/entity 做最多 2-hop graph expansion；
+6. 合并去重后交给 GraphRAG scorer 排真正 Top100。
 
-### 原始敏感文件
+context 只用于生成 evaluation positive IDs。候选生成流程不读取 positive IDs，因此不会发生 gold injection。
 
-`data/api_keys.txt` 存在于数据目录，但 RankRAG 不读取它。真实 LLM provider 只从配置指定的环境变量读取 API key，避免把密钥耦合到数据处理流程。
+## Neural
 
-## 新增代码结构
-
-```text
-src/rankrag/
-  models.py             通用 Query/Candidate/Graph/Ranking 数据模型
-  data/                 DatasetAdapter、HotpotQA Adapter、流式 JSON 解析
-  graph/                GraphStore、NetworkX 实现、HotpotQA GraphBuilder
-  graphrag/             语义检索、图扩展、证据路径、可解释评分
-  ranker/               RankerModel、MLP、特征、训练、候选交互扩展点
-  llm/                  Provider、Prompt、JSON 解析、缓存、Reranker
-  evaluation/           Recall、NDCG、MRR、Hit@K
-  pipeline/             GraphRAG -> Neural -> LLM 三级流水线
-```
-
-根目录的 `run_pipeline.py`、`train.py` 和 `evaluate.py` 是远程 Linux 环境可直接调用的标准入口。配置位于 `configs/hotpotqa.yaml`，不依赖 IDE 或本地绝对路径。
-
-## 当前数据流
+Neural 与 GraphRAG 已彻底离线解耦：
 
 ```text
-hotpot_dev_subset.json (7,405 queries)
-        |
-        v
-Unified HotpotQA Adapter
-        |
-        v
-局部 NetworkX Graph + kg_extractions.jsonl
-        |
-        v
-graphrag.jsonl  ->  neural.jsonl  ->  llm.jsonl
- Top-100             Top-20            Top-10
+graphrag.jsonl
+ -> prepare_ranker_dataset.py
+ -> train/validation Tensor shards
+ -> Candidate Set Transformer
 ```
 
-如果某题的候选数少于 100、20 或 10，代码使用实际候选数量，不会人为复制候选。
+训练 epoch 只读取 `[B,K,D]` Tensor。多 worker shard 分配先构造统一 epoch permutation，再按 worker 切片。validation no-positive query 计入指标分母并贡献 0。推理默认只处理 validation，train 诊断使用独立 `neural.train.jsonl`。
 
-## 当前限制与后续方向
+## 接口稳定性
 
-当前预处理 KG 没有覆盖完整训练段落库，标题级核对显示约 6.85% 的训练唯一标题与已有 KG 重叠。训练集完整运行使用 `configs/hotpotqa_train.yaml`：已有 KG 的段落使用实体关系，没有 KG 的训练段落使用确定性的文本词项图兜底，因此可以完整生成 GraphRAG 结果；补齐训练集 KG 后可替换该兜底以提升图质量。
+GraphRAG 仍输出 `RankingResult` 和有序 `RankedCandidate`，字段保留 semantic/graph/rag score、evidence nodes、evidence edges、paths 和 rank。因此下游 Tensor preprocessing、Neural Top20 和 LLM Top10 接口不需要修改。
 
-当前默认 embedding 是可复现的 CPU hashing baseline；远程服务器可以切换到 SentenceTransformer/BGE/E5。当前 LLM 默认是 offline passthrough provider，真实 API provider 已实现但需要用户配置 endpoint 和环境变量。
+## 尚需远程完成的工作
 
-## 训练集完整 KG 方案
+本地没有 GPU，也没有完整的 483,696 行新 KG 输出，因此以下大任务必须在远程机器执行：
 
-训练集 KG 抽取脚本为 `scripts/extract_kg_gliner_rebel.py`，配置为 `configs/kg_train_gliner_rebel.yaml`。它使用 GLiNER 识别实体、REBEL 生成关系三元组，支持：
+1. 校验完整 KG 行数；
+2. 构建全量 corpus embedding、FAISS 和 global graph assets；
+3. 对 90,447 query 运行全局 GraphRAG；
+4. 生成 Tensor shards 并训练 100 epochs；
+5. 对 validation 推理和评估。
 
-- 顶层 JSON 流式读取，不把 483,696 条段落一次性载入内存。
-- `--num-shards` / `--shard-index` 分片并行。
-- 每条 JSONL 记录即时 flush，异常退出后可 `--resume` 继续。
-- `scripts/merge_kg_jsonl.py` 合并时检查重复 ID、字段完整性和总数量。
-
-完整 KG 合并后，`configs/hotpotqa_train_fullkg.yaml` 将 `lexical_fallback` 关闭，只使用新生成的训练集 KG。
+直接复制的命令分别见 `RUN_GLOBAL_GRAPHRAG_CN.md` 和 `RUN_TRAIN_NEURAL_CN.md`。

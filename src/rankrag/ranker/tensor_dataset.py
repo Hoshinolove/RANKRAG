@@ -51,12 +51,19 @@ class TensorShardBatchDataset(IterableDataset):
         worker = get_worker_info()
         worker_id = worker.id if worker else 0
         worker_count = worker.num_workers if worker else 1
-        rng = random.Random(self.seed + self._iteration * 1009 + worker_id)
+        epoch = self._iteration
         self._iteration += 1
+
+        # Every worker must start from the same epoch-level shard permutation.
+        # Only after that common ordering is built may workers take disjoint slices.
+        shard_rng = random.Random(self.seed + epoch * 1009)
         shards = self.shards[:]
         if self.shuffle:
-            rng.shuffle(shards)
+            shard_rng.shuffle(shards)
         shards = shards[worker_id::worker_count]
+
+        # Sample order is local to a worker and does not affect shard ownership.
+        sample_rng = random.Random(self.seed + epoch * 1009 + worker_id * 1_000_003)
         for shard_info in shards:
             shard = torch.load(
                 resolve_shard_path(self.manifest, shard_info["tensor"]),
@@ -64,7 +71,10 @@ class TensorShardBatchDataset(IterableDataset):
                 weights_only=True,
             )
             count = int(shard["features"].shape[0])
-            indices = torch.randperm(count, generator=torch.Generator().manual_seed(rng.randrange(2**31))) if self.shuffle else torch.arange(count)
+            indices = torch.randperm(
+                count,
+                generator=torch.Generator().manual_seed(sample_rng.randrange(2**31)),
+            ) if self.shuffle else torch.arange(count)
             for start in range(0, count, self.batch_size):
                 batch_indices = indices[start : start + self.batch_size]
                 yield {
