@@ -1,0 +1,49 @@
+# 训练集 GraphRAG 配置。
+# 远程 Linux 机器上从项目根目录执行：
+# python run_pipeline.py --config configs/hotpotqa_train.yaml --stage graphrag --force
+dataset:
+  name: hotpotqa
+  path: data/hotpot_train.json
+
+graph:
+  # 使用 GLiNER + REBEL 完成训练集 KG 后，改用 hotpotqa_train_fullkg.yaml。
+  extractions_path: data/kg_extractions.jsonl
+  lexical_fallback: true
+  max_fallback_terms: 10
+
+embedding:
+  backend: hashing
+  dimension: 256
+  ngrams: 2
+
+retrieval:
+  top_k: 100
+  hops: 2
+  seed_k: 8
+  max_paths_per_candidate: 3
+  semantic_weight: 0.5
+  graph_weight: 0.5
+
+ranker:
+  top_k: 20
+  model: mlp
+  hidden_dim: 256
+  dropout: 0.1
+  device: cpu
+  representation_output_dim: 16
+  checkpoint: null
+
+llm:
+  provider: passthrough
+  model: null
+  top_k: 10
+  prompt_version: v1
+  cache_dir: llm_cache
+  max_text_chars: 4000
+
+evaluation:
+  ks: [5, 10, 20, 100]
+
+output:
+  root: outputs
+  experiment: hotpot_train_graphrag

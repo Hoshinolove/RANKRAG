@@ -1,0 +1,27 @@
+# 在远程 GPU 机器上执行训练段落的完整 KG 抽取。
+device: auto
+dtype: float16
+
+extraction:
+  input: data/hotpot_train_paragraphs.json
+  output_dir: outputs/kg_train_gliner_rebel
+  batch_size: 8
+  max_chars: 6000
+
+gliner:
+  model: urchade/gliner_large-v2.1
+  threshold: 0.35
+  labels:
+    - person
+    - organization
+    - location
+    - product
+    - event
+    - work
+    - date
+    - other
+
+rebel:
+  model: Babelscape/rebel-large
+  max_input_tokens: 512
+  max_new_tokens: 128

@@ -1,0 +1,30 @@
+[
+  {
+    "id": "q1",
+    "question": "Which city does Alice live in?",
+    "answer": "Paris",
+    "type": "bridge",
+    "level": "easy",
+    "supporting_facts": {"title": ["Alice", "Paris"], "sent_id": [0, 0]},
+    "context": {
+      "title": ["Noise", "Alice", "Paris"],
+      "sentences": [
+        ["A completely unrelated paragraph."],
+        ["Alice lives in Paris."],
+        ["Paris is a city in France."]
+      ]
+    }
+  },
+  {
+    "id": "q2",
+    "question": "What color is the sky?",
+    "answer": "blue",
+    "type": "comparison",
+    "level": "easy",
+    "supporting_facts": {"title": ["Sky"], "sent_id": [0]},
+    "context": {
+      "title": ["Grass", "Sky"],
+      "sentences": [["Grass is green."], ["The sky is blue."]]
+    }
+  }
+]

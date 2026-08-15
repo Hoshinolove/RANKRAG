@@ -1,0 +1,58 @@
+dataset:
+  name: hotpotqa
+  path: data/hotpot_dev_subset.json
+
+graph:
+  # Existing paragraph-level entity and relationship extractions.
+  extractions_path: data/kg_extractions.jsonl
+  lexical_fallback: true
+  max_fallback_terms: 10
+
+embedding:
+  # Offline CPU baseline. Switch backend to sentence_transformer on the server.
+  backend: hashing
+  dimension: 256
+  ngrams: 2
+  # backend: sentence_transformer
+  # model: intfloat/e5-base-v2
+  # device: cuda
+
+retrieval:
+  top_k: 100
+  hops: 2
+  seed_k: 8
+  max_paths_per_candidate: 3
+  semantic_weight: 0.5
+  graph_weight: 0.5
+
+ranker:
+  top_k: 20
+  model: mlp
+  hidden_dim: 256
+  dropout: 0.1
+  device: cpu
+  representation_output_dim: 16
+  checkpoint: null
+
+training:
+  epochs: 3
+  learning_rate: 0.001
+  seed: 13
+
+llm:
+  # passthrough is the deterministic offline baseline. For Qwen/DeepSeek/OpenAI
+  # compatible APIs use provider: openai_compatible and set base_url/model.
+  provider: passthrough
+  model: null
+  top_k: 10
+  prompt_version: v1
+  cache_dir: llm_cache
+  max_text_chars: 4000
+  api_key_env: OPENAI_API_KEY
+
+evaluation:
+  ks: [5, 10, 20, 100]
+
+output:
+  root: outputs
+  experiment: hashing_baseline

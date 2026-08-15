@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rankrag"
+version = "0.1.0"
+description = "Dataset-agnostic GraphRAG cascade ranking research framework"
+requires-python = ">=3.10"
+dependencies = [
+  "networkx>=3.0",
+  "numpy>=1.24",
+  "PyYAML>=6.0",
+  "torch>=2.0",
+]
+
+[project.optional-dependencies]
+embeddings = ["sentence-transformers>=2.7"]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
