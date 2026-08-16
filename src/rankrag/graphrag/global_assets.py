@@ -68,6 +68,34 @@ def build_semantic_assets(
     return {"paragraph_count": len(corpus), "embedding_dim": embedder.dimension, "faiss_ntotal": int(index.ntotal)}
 
 
+def inspect_semantic_assets(embeddings_path: str | Path, faiss_path: str | Path) -> dict[str, int]:
+    """Recover and validate manifest statistics from cached semantic assets."""
+    try:
+        import faiss
+    except ImportError as exc:
+        raise RuntimeError("FAISS is required to inspect cached retrieval assets") from exc
+
+    embeddings = np.load(embeddings_path, mmap_mode="r")
+    if embeddings.ndim != 2:
+        raise ValueError(f"Expected a 2D embedding matrix, got shape {embeddings.shape}")
+    index = faiss.read_index(str(faiss_path))
+    paragraph_count, embedding_dim = (int(value) for value in embeddings.shape)
+    if int(index.ntotal) != paragraph_count:
+        raise ValueError(
+            f"FAISS/vector count mismatch: index={int(index.ntotal)}, embeddings={paragraph_count}"
+        )
+    if int(index.d) != embedding_dim:
+        raise ValueError(f"FAISS/embedding dimension mismatch: index={int(index.d)}, embeddings={embedding_dim}")
+    mmap = getattr(embeddings, "_mmap", None)
+    if mmap is not None:
+        mmap.close()
+    return {
+        "paragraph_count": paragraph_count,
+        "embedding_dim": embedding_dim,
+        "faiss_ntotal": int(index.ntotal),
+    }
+
+
 class SemanticParagraphIndex:
     def __init__(
         self,
@@ -100,21 +128,42 @@ class SemanticParagraphIndex:
         return int(self.embeddings.shape[1])
 
     def search(self, query_vector: np.ndarray, top_k: int) -> list[tuple[str, float]]:
+        return self.search_batch(np.asarray(query_vector).reshape(1, -1), top_k)[0]
+
+    def search_batch(self, query_vectors: np.ndarray, top_k: int) -> list[list[tuple[str, float]]]:
+        """Search a query matrix with one FAISS call while preserving query order."""
         top_k = min(max(0, top_k), len(self.corpus))
+        vectors = np.asarray(query_vectors, dtype=np.float32)
+        if vectors.ndim != 2 or vectors.shape[1] != self.dimension:
+            raise ValueError(
+                f"Expected query vectors with shape [B, {self.dimension}], got {vectors.shape}"
+            )
         if not top_k:
-            return []
-        vector = np.asarray(query_vector, dtype=np.float32).reshape(1, -1)
-        vector /= max(float(np.linalg.norm(vector)), 1e-12)
+            return [[] for _ in range(len(vectors))]
+        vectors = vectors.copy()
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        vectors /= np.maximum(norms, 1e-12)
         if self.backend == "faiss":
-            scores, rows = self.index.search(vector, top_k)
+            scores, rows = self.index.search(vectors, top_k)
             return [
-                (self.corpus.records[int(row)].paragraph_id, float(score))
-                for row, score in zip(rows[0], scores[0], strict=True)
-                if int(row) >= 0
+                [
+                    (self.corpus.records[int(row)].paragraph_id, float(score))
+                    for row, score in zip(query_rows, query_scores, strict=True)
+                    if int(row) >= 0
+                ]
+                for query_rows, query_scores in zip(rows, scores, strict=True)
             ]
-        scores = np.asarray(self.embeddings @ vector[0])
-        rows = np.argsort(-scores, kind="stable")[:top_k]
-        return [(self.corpus.records[int(row)].paragraph_id, float(scores[int(row)])) for row in rows]
+        results: list[list[tuple[str, float]]] = []
+        for vector in vectors:
+            query_scores = np.asarray(self.embeddings @ vector)
+            query_rows = np.argsort(-query_scores, kind="stable")[:top_k]
+            results.append(
+                [
+                    (self.corpus.records[int(row)].paragraph_id, float(query_scores[int(row)]))
+                    for row in query_rows
+                ]
+            )
+        return results
 
     def scores(self, query_vector: np.ndarray, paragraph_ids: Sequence[str]) -> dict[str, float]:
         if not paragraph_ids:
@@ -240,9 +289,36 @@ def build_global_graph_index(
         "entity_paragraph_edges": connection.execute("SELECT COUNT(*) FROM entity_to_paragraphs").fetchone()[0],
         "entity_relation_edges": connection.execute("SELECT COUNT(*) FROM entity_relation_adjacency").fetchone()[0],
     }
+    connection.execute("CREATE TABLE build_metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+    connection.executemany("INSERT INTO build_metadata VALUES (?, ?)", counts.items())
     connection.commit()
     connection.close()
     os.replace(temporary, destination)
+    return counts
+
+
+def inspect_global_graph_index(path: str | Path) -> dict[str, int | None]:
+    """Recover available statistics from an existing global graph SQLite index."""
+    uri = f"file:{Path(path).resolve().as_posix()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    has_metadata = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='build_metadata'"
+    ).fetchone()
+    if has_metadata:
+        counts: dict[str, int | None] = {
+            str(key): int(value) for key, value in connection.execute("SELECT key, value FROM build_metadata")
+        }
+    else:
+        counts = {
+            "kg_records": None,
+            "mapped_kg_records": None,
+            "paragraph_entity_edges": int(connection.execute("SELECT COUNT(*) FROM paragraph_to_entities").fetchone()[0]),
+            "entity_paragraph_edges": int(connection.execute("SELECT COUNT(*) FROM entity_to_paragraphs").fetchone()[0]),
+            "entity_relation_edges": int(
+                connection.execute("SELECT COUNT(*) FROM entity_relation_adjacency").fetchone()[0]
+            ),
+        }
+    connection.close()
     return counts
 
 

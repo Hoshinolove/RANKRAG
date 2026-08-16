@@ -27,7 +27,7 @@ def pipeline_main() -> None:
             print(f"Reusing {stage}: {output_path}")
             continue
         if stage == "graphrag":
-            pipeline.run_graphrag(args.limit)
+            pipeline.run_graphrag(args.limit, force=args.force)
         elif stage == "neural":
             pipeline.run_neural(split=inference_split)
         else:

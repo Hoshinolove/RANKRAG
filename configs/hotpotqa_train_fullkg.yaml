@@ -24,6 +24,9 @@ global_retrieval:
   manifest_path: outputs/hotpotqa_global_assets/train/manifest.json
   index_backend: faiss
   embedding_batch_size: 256
+  query_batch_size: 256
+  graph_workers: null
+  output_shard_size: 1024
   semantic_top_k: 500
   seed_paragraph_k: 20
   graph_hops: 2

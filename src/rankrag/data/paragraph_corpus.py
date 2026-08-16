@@ -98,3 +98,23 @@ def build_paragraph_corpus(input_paths: Sequence[str | Path], output_path: str |
         "corpus_sha256": digest.hexdigest(),
         "corpus_path": str(destination),
     }
+
+
+def inspect_paragraph_corpus(input_paths: Sequence[str | Path], corpus_path: str | Path) -> dict[str, Any]:
+    """Recover manifest statistics for an already-built paragraph corpus."""
+    input_count = sum(1 for path in input_paths for _ in iter_json_array(path))
+    paragraph_count = 0
+    digest = hashlib.sha256()
+    corpus = Path(corpus_path)
+    with corpus.open("rb") as handle:
+        for line in handle:
+            if line.strip():
+                paragraph_count += 1
+            digest.update(line)
+    return {
+        "input_records": input_count,
+        "paragraph_count": paragraph_count,
+        "duplicates_removed": input_count - paragraph_count,
+        "corpus_sha256": digest.hexdigest(),
+        "corpus_path": str(corpus),
+    }

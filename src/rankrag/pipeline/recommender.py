@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+from itertools import islice
 import json
+import os
 from pathlib import Path
 import shutil
 from typing import Any
@@ -16,6 +19,8 @@ from rankrag.graphrag.global_retrieval import (
     HybridCandidateConfig,
     HybridCandidateGenerator,
     HybridGraphRAGRetriever,
+    create_graph_expansion_executor,
+    default_graph_workers,
 )
 from rankrag.graphrag.scorer import WeightedCandidateScorer
 from rankrag.io import iter_results, write_json, write_jsonl
@@ -69,10 +74,10 @@ class CascadePipeline:
     def retrieval_stats_path(self) -> Path:
         return self.output_dir / "graphrag_retrieval_stats.json"
 
-    def run_graphrag(self, limit: int | None = None) -> Path:
+    def run_graphrag(self, limit: int | None = None, force: bool = False) -> Path:
         global_config = self.config.get("global_retrieval", {})
         if global_config.get("enabled", False):
-            return self._run_global_graphrag(global_config, limit)
+            return self._run_global_graphrag(global_config, limit, force)
         graph_config = self.config.get("graph", {})
         index = KGExtractionIndex(graph_config.get("extractions_path"))
         titles: set[str] = set()
@@ -98,7 +103,12 @@ class CascadePipeline:
         write_jsonl(self.graphrag_path, (retriever.rank(instance) for instance in self.adapter.iter_instances(limit)))
         return self.graphrag_path
 
-    def _run_global_graphrag(self, global_config: dict[str, Any], limit: int | None) -> Path:
+    def _run_global_graphrag(
+        self,
+        global_config: dict[str, Any],
+        limit: int | None,
+        force: bool = False,
+    ) -> Path:
         asset_dir = Path(global_config.get("asset_dir", "outputs/global_retrieval"))
         corpus_path = Path(global_config.get("corpus_path", asset_dir / "corpus.jsonl"))
         embeddings_path = Path(global_config.get("embeddings_path", asset_dir / "paragraph_embeddings.npy"))
@@ -125,27 +135,98 @@ class CascadePipeline:
             backend=str(global_config.get("index_backend", "faiss")),
         )
         graph_index = GlobalGraphIndex(graph_path)
+        candidate_config = HybridCandidateConfig(
+            semantic_top_k=int(global_config.get("semantic_top_k", 500)),
+            seed_paragraph_k=int(global_config.get("seed_paragraph_k", 20)),
+            graph_hops=min(2, int(global_config.get("graph_hops", 2))),
+            max_graph_candidates=int(global_config.get("max_graph_candidates", 1000)),
+            max_entities_per_hop=int(global_config.get("max_entities_per_hop", 500)),
+            max_relations_per_entity=int(global_config.get("max_relations_per_entity", 100)),
+            max_paragraphs_per_entity=int(global_config.get("max_paragraphs_per_entity", 100)),
+            max_paths_per_candidate=int(global_config.get("max_paths_per_candidate", 3)),
+        )
         candidate_generator = HybridCandidateGenerator(
             corpus,
             semantic_index,
             graph_index,
             self.embedder,
-            HybridCandidateConfig(
-                semantic_top_k=int(global_config.get("semantic_top_k", 500)),
-                seed_paragraph_k=int(global_config.get("seed_paragraph_k", 20)),
-                graph_hops=min(2, int(global_config.get("graph_hops", 2))),
-                max_graph_candidates=int(global_config.get("max_graph_candidates", 1000)),
-                max_entities_per_hop=int(global_config.get("max_entities_per_hop", 500)),
-                max_relations_per_entity=int(global_config.get("max_relations_per_entity", 100)),
-                max_paragraphs_per_entity=int(global_config.get("max_paragraphs_per_entity", 100)),
-                max_paths_per_candidate=int(global_config.get("max_paths_per_candidate", 3)),
-            ),
+            candidate_config,
         )
         retrieval = self.config.get("retrieval", {})
         retriever = HybridGraphRAGRetriever(
             candidate_generator,
             WeightedCandidateScorer(float(retrieval.get("semantic_weight", 0.5)), float(retrieval.get("graph_weight", 0.5))),
             top_k=int(retrieval.get("top_k", 100)),
+        )
+        query_batch_size = max(1, int(global_config.get("query_batch_size", 256)))
+        output_shard_size = max(query_batch_size, int(global_config.get("output_shard_size", 1024)))
+        raw_graph_workers = global_config.get("graph_workers")
+        graph_workers = default_graph_workers() if raw_graph_workers is None else max(1, int(raw_graph_workers))
+        shard_dir = self.output_dir / "graphrag_shards"
+        shard_manifest_path = shard_dir / "manifest.json"
+        dataset_path = Path(self.config["dataset"]["path"])
+        dataset_stat = dataset_path.stat()
+        signature_payload = {
+            "pipeline_schema_version": 2,
+            "dataset": {
+                "path": str(dataset_path.resolve()),
+                "size": dataset_stat.st_size,
+                "mtime_ns": dataset_stat.st_mtime_ns,
+            },
+            "embedding": self.config.get("embedding", {}),
+            "global_retrieval": global_config,
+            "retrieval": retrieval,
+            "asset_manifest": asset_manifest,
+            "limit": limit,
+            "output_shard_size": output_shard_size,
+        }
+        signature = hashlib.sha256(
+            json.dumps(signature_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        if force:
+            self.graphrag_path.unlink(missing_ok=True)
+            if shard_dir.exists():
+                for path in shard_dir.glob("part-*.jsonl"):
+                    path.unlink()
+                for path in shard_dir.glob("part-*.jsonl.tmp"):
+                    path.unlink()
+                shard_manifest_path.unlink(missing_ok=True)
+        elif self.graphrag_path.exists():
+            semantic_index.close()
+            graph_index.close()
+            return self.graphrag_path
+
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        if shard_manifest_path.exists():
+            shard_manifest = json.loads(shard_manifest_path.read_text(encoding="utf-8"))
+            if shard_manifest.get("signature") != signature:
+                semantic_index.close()
+                graph_index.close()
+                raise ValueError(
+                    "Existing GraphRAG shards were created from different data, assets, or configuration. "
+                    "Run the GraphRAG stage with --force to start a clean run."
+                )
+        else:
+            if any(shard_dir.glob("part-*.jsonl")):
+                semantic_index.close()
+                graph_index.close()
+                raise ValueError("GraphRAG shard manifest is missing; use --force to discard unverified shards")
+            shard_manifest = {
+                "schema_version": 1,
+                "signature": signature,
+                "query_batch_size": query_batch_size,
+                "output_shard_size": output_shard_size,
+                "graph_workers": graph_workers,
+                "complete": False,
+            }
+            write_json(shard_manifest_path, shard_manifest)
+
+        timing_fields = (
+            "query_embedding_time_ms",
+            "semantic_search_time_ms",
+            "graph_expansion_time_ms",
+            "evidence_serialization_time_ms",
+            "total_query_time_ms",
         )
         totals = {
             "queries": 0,
@@ -154,31 +235,105 @@ class CascadePipeline:
             "Recall@100": 0.0,
             "graph_expansion_candidate_count": 0.0,
             "retrieval_time_ms": 0.0,
+            **{field: 0.0 for field in timing_fields},
         }
+        shard_paths: list[Path] = []
+        resumed_shards = 0
+        computed_shards = 0
+        graph_executor = None
+        graph_executor_initialized = False
 
-        def iter_ranked():
-            for instance in self.adapter.iter_instances(limit):
-                result = retriever.rank(instance)
-                totals["queries"] += 1
-                totals["candidate_pool_size"] += float(result.metadata["candidate_pool_size"])
-                totals["gold_recall_before_graphrag"] += float(result.metadata["gold_recall_before_graphrag"])
-                totals["Recall@100"] += float(result.metadata["recall_at_100"])
-                totals["graph_expansion_candidate_count"] += float(result.metadata["graph_expansion_candidate_count"])
-                totals["retrieval_time_ms"] += float(result.metadata["retrieval_time_ms"])
-                yield result
+        def add_statistics(result) -> None:
+            totals["queries"] += 1
+            totals["candidate_pool_size"] += float(result.metadata["candidate_pool_size"])
+            totals["gold_recall_before_graphrag"] += float(result.metadata["gold_recall_before_graphrag"])
+            totals["Recall@100"] += float(result.metadata["recall_at_100"])
+            totals["graph_expansion_candidate_count"] += float(result.metadata["graph_expansion_candidate_count"])
+            totals["retrieval_time_ms"] += float(result.metadata.get("retrieval_time_ms", 0.0))
+            for field in timing_fields:
+                totals[field] += float(result.metadata.get(field, 0.0))
 
-        write_jsonl(self.graphrag_path, iter_ranked())
-        semantic_index.close()
-        graph_index.close()
+        try:
+            instances = iter(self.adapter.iter_instances(limit))
+            shard_index = 0
+            while True:
+                instance_shard = list(islice(instances, output_shard_size))
+                if not instance_shard:
+                    break
+                shard_path = shard_dir / f"part-{shard_index:06d}.jsonl"
+                expected_ids = [instance.query.query_id for instance in instance_shard]
+                if shard_path.exists():
+                    actual_ids = []
+                    for result in iter_results(shard_path):
+                        actual_ids.append(result.query_id)
+                        add_statistics(result)
+                    if actual_ids != expected_ids:
+                        raise ValueError(
+                            f"Cannot resume: query IDs in {shard_path} do not match the current dataset. "
+                            "Use --force to rebuild GraphRAG shards."
+                        )
+                    resumed_shards += 1
+                else:
+                    if not graph_executor_initialized:
+                        graph_executor = create_graph_expansion_executor(
+                            graph_path,
+                            candidate_config,
+                            graph_workers,
+                        )
+                        graph_executor_initialized = True
+
+                    def iter_computed_results():
+                        for start in range(0, len(instance_shard), query_batch_size):
+                            batch = instance_shard[start : start + query_batch_size]
+                            for result in retriever.rank_batch(batch, graph_executor):
+                                add_statistics(result)
+                                yield result
+
+                    write_jsonl(shard_path, iter_computed_results())
+                    computed_shards += 1
+                shard_paths.append(shard_path)
+                shard_index += 1
+                print(
+                    f"graphrag_shard={shard_index} queries={int(totals['queries'])} "
+                    f"resumed={resumed_shards} computed={computed_shards}",
+                    flush=True,
+                )
+
+            temporary_output = self.graphrag_path.with_suffix(self.graphrag_path.suffix + ".tmp")
+            with temporary_output.open("wb") as destination:
+                for shard_path in shard_paths:
+                    with shard_path.open("rb") as source:
+                        shutil.copyfileobj(source, destination)
+            os.replace(temporary_output, self.graphrag_path)
+            shard_manifest.update(
+                {
+                    "complete": True,
+                    "queries": int(totals["queries"]),
+                    "shards": len(shard_paths),
+                }
+            )
+            write_json(shard_manifest_path, shard_manifest)
+        finally:
+            if graph_executor is not None:
+                graph_executor.shutdown(wait=True)
+            semantic_index.close()
+            graph_index.close()
+
         count = int(totals["queries"])
         summary = {
             "queries": count,
+            "query_batch_size": query_batch_size,
+            "graph_workers": graph_workers,
+            "output_shards": len(shard_paths),
+            "resumed_shards": resumed_shards,
+            "computed_shards": computed_shards,
             "average_candidate_pool_size": totals["candidate_pool_size"] / count if count else 0.0,
             "gold_recall_before_graphrag": totals["gold_recall_before_graphrag"] / count if count else 0.0,
             "Recall@100": totals["Recall@100"] / count if count else 0.0,
             "average_graph_expansion_candidate_count": totals["graph_expansion_candidate_count"] / count if count else 0.0,
             "average_retrieval_time_ms": totals["retrieval_time_ms"] / count if count else 0.0,
             "total_retrieval_time_seconds": totals["retrieval_time_ms"] / 1000.0,
+            **{field: totals[field] / count if count else 0.0 for field in timing_fields},
         }
         write_json(self.retrieval_stats_path, summary)
         return self.graphrag_path
