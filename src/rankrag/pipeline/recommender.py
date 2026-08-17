@@ -8,13 +8,12 @@ from pathlib import Path
 import shutil
 from typing import Any
 
-from rankrag.data.hotpotqa import HotpotQAAdapter
-from rankrag.data.paragraph_corpus import ParagraphCorpus
+from rankrag.data.factory import create_candidate_corpus, create_dataset_adapter
 from rankrag.embedding import create_embedder
 from rankrag.evaluation.evaluator import evaluate_results
-from rankrag.graph.builder import HotpotQAGraphBuilder, KGExtractionIndex
+from rankrag.graph.factory import create_candidate_graph_index, create_instance_graph_builder
 from rankrag.graphrag.retriever import GraphRAGRetriever, RetrievalConfig
-from rankrag.graphrag.global_assets import GlobalGraphIndex, SemanticParagraphIndex
+from rankrag.graphrag.global_assets import SemanticCandidateIndex
 from rankrag.graphrag.global_retrieval import (
     HybridCandidateConfig,
     HybridCandidateGenerator,
@@ -23,11 +22,13 @@ from rankrag.graphrag.global_retrieval import (
     default_graph_workers,
 )
 from rankrag.graphrag.scorer import WeightedCandidateScorer
+from rankrag.graphrag.seeds import create_seed_provider
 from rankrag.io import iter_results, write_json, write_jsonl
 from rankrag.llm.cache import LLMResponseCache
 from rankrag.llm.client import create_provider
 from rankrag.llm.reranker import LLMReranker
 from rankrag.ranker.tensor_inference import iter_tensor_rankings
+from rankrag.ranker.tensor_dataset import load_manifest, load_split_query_ids
 
 
 class CascadePipeline:
@@ -35,13 +36,7 @@ class CascadePipeline:
         self.config = config
         self.config_path = Path(config_path) if config_path else None
         dataset = config.get("dataset", {})
-        if dataset.get("name", "hotpotqa") != "hotpotqa":
-            raise ValueError("This release includes only the HotpotQA adapter")
-        global_retrieval = config.get("global_retrieval", {})
-        self.adapter = HotpotQAAdapter(
-            dataset["path"],
-            use_paragraph_ids=bool(global_retrieval.get("enabled", False)),
-        )
+        self.adapter = create_dataset_adapter(config)
         output = config.get("output", {})
         self.output_dir = Path(output.get("root", "outputs")) / dataset.get("name", "hotpotqa") / output.get("experiment", "baseline")
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -59,6 +54,13 @@ class CascadePipeline:
     def graphrag_path(self) -> Path:
         return self.output_dir / "graphrag.jsonl"
 
+    def graphrag_split_path(self, split: str = "validation") -> Path:
+        return self.output_dir / f"graphrag.{split}.jsonl"
+
+    @property
+    def graphrag_validation_path(self) -> Path:
+        return self.graphrag_split_path("validation")
+
     @property
     def neural_path(self) -> Path:
         return self.output_dir / "neural.jsonl"
@@ -70,28 +72,85 @@ class CascadePipeline:
     def llm_path(self) -> Path:
         return self.output_dir / "llm.jsonl"
 
+    def llm_split_path(self, split: str = "validation") -> Path:
+        return self.llm_path if split == "validation" else self.output_dir / f"llm.{split}.jsonl"
+
     @property
     def retrieval_stats_path(self) -> Path:
         return self.output_dir / "graphrag_retrieval_stats.json"
+
+    def _evaluation_split(self) -> str:
+        return str(
+            self.config.get("evaluation", {}).get(
+                "split",
+                self.config.get("ranker", {}).get("inference_split", "validation"),
+            )
+        )
+
+    def _split_query_ids(self, split: str) -> list[str]:
+        manifest_path = self.config.get("ranker_dataset", {}).get("manifest")
+        if not manifest_path:
+            raise ValueError("A ranker_dataset.manifest is required for split-aligned evaluation")
+        if not Path(manifest_path).exists():
+            raise FileNotFoundError(f"Ranker tensor manifest not found: {manifest_path}")
+        return load_split_query_ids(load_manifest(manifest_path), split)
+
+    def prepare_graphrag_split(self, split: str | None = None, force: bool = False) -> Path:
+        """Filter cached full GraphRAG results to a manifest-defined split without retrieval."""
+        split = split or self._evaluation_split()
+        if not self.graphrag_path.exists():
+            raise FileNotFoundError(f"Full GraphRAG cache not found: {self.graphrag_path}")
+        output_path = self.graphrag_split_path(split)
+        if output_path.exists() and not force:
+            return output_path
+        expected_ids = self._split_query_ids(split)
+        expected_set = set(expected_ids)
+        selected_ids: list[str] = []
+        seen_source_ids: set[str] = set()
+
+        def iter_selected_results():
+            for result in iter_results(self.graphrag_path):
+                if result.query_id in seen_source_ids:
+                    raise ValueError(f"Full GraphRAG cache contains duplicate query ID: {result.query_id}")
+                seen_source_ids.add(result.query_id)
+                if result.query_id in expected_set:
+                    selected_ids.append(result.query_id)
+                    yield result
+            if selected_ids != expected_ids:
+                missing = sorted(expected_set - set(selected_ids))
+                raise ValueError(
+                    f"GraphRAG {split!r} query order does not match the ranker manifest; "
+                    f"selected={len(selected_ids)} expected={len(expected_ids)} missing={missing[:5]}"
+                )
+
+        write_jsonl(output_path, iter_selected_results())
+        return output_path
+
+    @staticmethod
+    def _result_query_ids(path: Path) -> list[str]:
+        query_ids = [result.query_id for result in iter_results(path)]
+        if len(set(query_ids)) != len(query_ids):
+            raise ValueError(f"Ranking output contains duplicate query IDs: {path}")
+        return query_ids
+
+    def _validate_split_alignment(self, paths: dict[str, Path], split: str) -> None:
+        expected_ids = self._split_query_ids(split)
+        for stage, path in paths.items():
+            actual_ids = self._result_query_ids(path)
+            if actual_ids != expected_ids:
+                raise ValueError(
+                    f"{stage} output is not aligned to ranker split {split!r}: "
+                    f"queries={len(actual_ids)} expected={len(expected_ids)} path={path}"
+                )
 
     def run_graphrag(self, limit: int | None = None, force: bool = False) -> Path:
         global_config = self.config.get("global_retrieval", {})
         if global_config.get("enabled", False):
             return self._run_global_graphrag(global_config, limit, force)
-        graph_config = self.config.get("graph", {})
-        index = KGExtractionIndex(graph_config.get("extractions_path"))
-        titles: set[str] = set()
-        for instance in self.adapter.iter_instances(limit):
-            titles.update(candidate.candidate_id for candidate in instance.candidates)
-        index.load_for_titles(titles)
         retrieval = self.config.get("retrieval", {})
         retriever = GraphRAGRetriever(
             self.embedder,
-            HotpotQAGraphBuilder(
-                index,
-                lexical_fallback=bool(graph_config.get("lexical_fallback", True)),
-                max_fallback_terms=int(graph_config.get("max_fallback_terms", 10)),
-            ),
+            create_instance_graph_builder(self.config, self.adapter, limit),
             WeightedCandidateScorer(float(retrieval.get("semantic_weight", 0.5)), float(retrieval.get("graph_weight", 0.5))),
             RetrievalConfig(
                 top_k=int(retrieval.get("top_k", 100)),
@@ -127,30 +186,33 @@ class CascadePipeline:
         asset_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if asset_manifest.get("embedding") != self.config.get("embedding", {}):
             raise ValueError("Offline embedding configuration differs from the query embedder; rebuild global assets")
-        corpus = ParagraphCorpus.load(corpus_path)
-        semantic_index = SemanticParagraphIndex(
+        corpus = create_candidate_corpus(self.config)
+        semantic_index = SemanticCandidateIndex(
             corpus,
             embeddings_path,
             faiss_path,
             backend=str(global_config.get("index_backend", "faiss")),
         )
-        graph_index = GlobalGraphIndex(graph_path)
+        graph_index = create_candidate_graph_index(self.config)
         candidate_config = HybridCandidateConfig(
             semantic_top_k=int(global_config.get("semantic_top_k", 500)),
-            seed_paragraph_k=int(global_config.get("seed_paragraph_k", 20)),
+            seed_candidate_k=int(global_config.get("seed_candidate_k", global_config.get("seed_paragraph_k", 20))),
             graph_hops=min(2, int(global_config.get("graph_hops", 2))),
             max_graph_candidates=int(global_config.get("max_graph_candidates", 1000)),
-            max_entities_per_hop=int(global_config.get("max_entities_per_hop", 500)),
-            max_relations_per_entity=int(global_config.get("max_relations_per_entity", 100)),
-            max_paragraphs_per_entity=int(global_config.get("max_paragraphs_per_entity", 100)),
+            max_nodes_per_hop=int(global_config.get("max_nodes_per_hop", global_config.get("max_entities_per_hop", 500))),
+            max_neighbors_per_node=int(global_config.get("max_neighbors_per_node", global_config.get("max_relations_per_entity", 100))),
+            max_candidates_per_node=int(global_config.get("max_candidates_per_node", global_config.get("max_paragraphs_per_entity", 100))),
             max_paths_per_candidate=int(global_config.get("max_paths_per_candidate", 3)),
+            graph_aggregation=str(global_config.get("graph_aggregation", "max")),
         )
+        seed_provider = create_seed_provider(self.config, candidate_config.seed_candidate_k)
         candidate_generator = HybridCandidateGenerator(
             corpus,
             semantic_index,
             graph_index,
             self.embedder,
             candidate_config,
+            seed_provider=seed_provider,
         )
         retrieval = self.config.get("retrieval", {})
         retriever = HybridGraphRAGRetriever(
@@ -164,17 +226,22 @@ class CascadePipeline:
         graph_workers = default_graph_workers() if raw_graph_workers is None else max(1, int(raw_graph_workers))
         shard_dir = self.output_dir / "graphrag_shards"
         shard_manifest_path = shard_dir / "manifest.json"
-        dataset_path = Path(self.config["dataset"]["path"])
-        dataset_stat = dataset_path.stat()
+        dataset_sources = []
+        for source_path in self.adapter.source_paths():
+            source_stat = source_path.stat()
+            dataset_sources.append(
+                {
+                    "path": str(source_path.resolve()),
+                    "size": source_stat.st_size,
+                    "mtime_ns": source_stat.st_mtime_ns,
+                }
+            )
         signature_payload = {
             "pipeline_schema_version": 2,
-            "dataset": {
-                "path": str(dataset_path.resolve()),
-                "size": dataset_stat.st_size,
-                "mtime_ns": dataset_stat.st_mtime_ns,
-            },
+            "dataset": {"config": self.config.get("dataset", {}), "sources": dataset_sources},
             "embedding": self.config.get("embedding", {}),
             "global_retrieval": global_config,
+            "seed_provider": self.config.get("seed_provider", {}),
             "retrieval": retrieval,
             "asset_manifest": asset_manifest,
             "limit": limit,
@@ -279,6 +346,7 @@ class CascadePipeline:
                             graph_path,
                             candidate_config,
                             graph_workers,
+                            graph_backend=graph_index.backend,
                         )
                         graph_executor_initialized = True
 
@@ -351,9 +419,13 @@ class CascadePipeline:
         write_jsonl(output_path, iter_tensor_rankings(self.config, split=split))
         return output_path
 
-    def run_llm(self) -> Path:
-        if not self.neural_path.exists():
-            raise FileNotFoundError(f"Run the neural stage first: {self.neural_path}")
+    def run_llm(self, split: str | None = None) -> Path:
+        split = split or self._evaluation_split()
+        neural_path = self.neural_split_path(split)
+        output_path = self.llm_split_path(split)
+        if not neural_path.exists():
+            raise FileNotFoundError(f"Run the neural stage first: {neural_path}")
+        self._validate_split_alignment({"neural": neural_path}, split)
         llm_config = self.config.get("llm", {})
         cache_dir = self.output_dir / llm_config.get("cache_dir", "llm_cache")
         reranker = LLMReranker(
@@ -363,14 +435,38 @@ class CascadePipeline:
             prompt_version=llm_config.get("prompt_version", "v1"),
             max_text_chars=int(llm_config.get("max_text_chars", 4000)),
         )
-        write_jsonl(self.llm_path, (reranker.rank(result) for result in iter_results(self.neural_path)))
-        return self.llm_path
+        write_jsonl(output_path, (reranker.rank(result) for result in iter_results(neural_path)))
+        return output_path
+
+    def _evaluation_ks(self, stage: str) -> list[int]:
+        evaluation = self.config.get("evaluation", {})
+        stage_ks = evaluation.get("stage_ks", {})
+        values = stage_ks.get(stage, evaluation.get("ks", [5, 10]))
+        return [int(k) for k in values]
 
     def evaluate(self) -> dict[str, dict[str, float | int]]:
-        ks = [int(k) for k in self.config.get("evaluation", {}).get("ks", [5, 10])]
+        split = self._evaluation_split()
+        neural_path = self.neural_split_path(split)
+        llm_path = self.llm_split_path(split)
+        manifest_value = self.config.get("ranker_dataset", {}).get("manifest")
+        manifest_exists = bool(manifest_value) and Path(manifest_value).exists()
+        if manifest_exists:
+            graphrag_split_path = self.prepare_graphrag_split(split)
+            stage_paths = {
+                "graphrag": graphrag_split_path,
+                **({"neural": neural_path} if neural_path.exists() else {}),
+                **({"llm": llm_path} if llm_path.exists() else {}),
+            }
+            self._validate_split_alignment(stage_paths, split)
+        else:
+            if neural_path.exists() or llm_path.exists():
+                raise FileNotFoundError(
+                    "Neural/LLM outputs exist but ranker_dataset.manifest is unavailable; "
+                    "split-aligned evaluation cannot be verified"
+                )
+            stage_paths = {"graphrag": self.graphrag_path} if self.graphrag_path.exists() else {}
         metrics = {}
-        for stage, path in (("graphrag", self.graphrag_path), ("neural", self.neural_path), ("llm", self.llm_path)):
-            if path.exists():
-                metrics[stage] = evaluate_results(iter_results(path), ks)
+        for stage, path in stage_paths.items():
+            metrics[stage] = evaluate_results(iter_results(path), self._evaluation_ks(stage))
         write_json(self.output_dir / "metrics.json", metrics)
         return metrics

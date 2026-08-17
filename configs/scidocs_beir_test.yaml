@@ -1,0 +1,110 @@
+dataset:
+  name: scidocs
+  adapter: scidocs
+  protocol: beir_test
+  split: test
+  beir_corpus_path: data/scidocs/beir/scidocs/corpus.jsonl
+  beir_queries_path: data/scidocs/beir/scidocs/queries.jsonl
+  beir_qrels_path: data/scidocs/beir/scidocs/qrels/test.tsv
+  expected_candidate_count: 25657
+  expected_query_count: 1000
+  expected_positive_judgment_count: 4928
+  missing_positive_policy: strict
+
+embedding:
+  backend: sentence_transformer
+  model: sentence-transformers/allenai-specter
+  device: cuda
+
+candidate_corpus:
+  path: outputs/scidocs_global_assets/beir_test/corpus.jsonl
+
+graph_index:
+  backend: generic_sqlite
+  path: outputs/scidocs_global_assets/beir_test/candidate_graph.sqlite
+
+scidocs_graph:
+  enrichment_paths:
+    - data/scidocs/original/paper_metadata_view_cite_read.json
+    - data/scidocs/original/paper_metadata_recomm.json
+    - data/scidocs/enrichment/papers.jsonl
+  require_enrichment: false
+  reverse_citations: true
+
+seed_provider:
+  type: weighted_query
+  semantic_seed_k: 50
+  use_query_weights: true
+  merge_strategy: max
+
+global_retrieval:
+  enabled: true
+  asset_dir: outputs/scidocs_global_assets/beir_test
+  corpus_path: outputs/scidocs_global_assets/beir_test/corpus.jsonl
+  embeddings_path: outputs/scidocs_global_assets/beir_test/candidate_embeddings.npy
+  faiss_index_path: outputs/scidocs_global_assets/beir_test/candidates.faiss
+  graph_index_path: outputs/scidocs_global_assets/beir_test/candidate_graph.sqlite
+  manifest_path: outputs/scidocs_global_assets/beir_test/manifest.json
+  index_backend: faiss
+  embedding_batch_size: 256
+  query_batch_size: 128
+  graph_workers: 4
+  output_shard_size: 500
+  semantic_top_k: 1000
+  seed_candidate_k: 50
+  graph_hops: 2
+  max_graph_candidates: 3000
+  max_nodes_per_hop: 1000
+  max_neighbors_per_node: 200
+  max_candidates_per_node: 500
+  max_paths_per_candidate: 5
+  graph_aggregation: noisy_or
+
+retrieval:
+  top_k: 100
+  semantic_weight: 0.7
+  graph_weight: 0.3
+
+ranker:
+  top_k: 20
+  model: set_transformer
+  hidden_dim: 256
+  num_heads: 8
+  num_layers: 3
+  feedforward_dim: 1024
+  dropout: 0.1
+  device: cuda
+  representation_output_dim: 16
+  checkpoint: outputs/scidocs/scidocs_development/ranker_checkpoints/best.pt
+  inference_split: test
+
+ranker_dataset:
+  graphrag_path: outputs/scidocs/scidocs_beir_test/graphrag.jsonl
+  output_dir: outputs/scidocs/scidocs_beir_test/ranker_dataset
+  manifest: outputs/scidocs/scidocs_beir_test/ranker_dataset/manifest.json
+  candidate_k: 100
+  shard_size: 256
+  storage_dtype: float16
+  split_strategy: source
+  source_splits: [test]
+
+# Used only for inference loader settings. Do not run train.py with this config.
+training:
+  batch_size: 128
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  amp: true
+  amp_dtype: bfloat16
+  checkpoint_dir: outputs/scidocs/scidocs_development/ranker_checkpoints
+
+evaluation:
+  split: test
+  stage_ks:
+    graphrag: [20, 50, 100]
+    neural: [5, 10, 20]
+    llm: [5, 10, 20]
+
+output:
+  root: outputs
+  experiment: scidocs_beir_test

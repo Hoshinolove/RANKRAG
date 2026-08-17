@@ -7,9 +7,14 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from rankrag.data.paragraph_corpus import build_paragraph_corpus
+from rankrag.data.paragraph_corpus import build_paragraph_corpus, inspect_paragraph_corpus
 from rankrag.embedding import create_embedder
-from rankrag.graphrag.global_assets import build_global_graph_index, build_semantic_assets
+from rankrag.graphrag.global_assets import (
+    build_global_graph_index,
+    build_semantic_assets,
+    inspect_global_graph_index,
+    inspect_semantic_assets,
+)
 from rankrag.io import load_config, write_json
 
 
@@ -24,6 +29,11 @@ def _paths(config: dict) -> dict[str, Path]:
         "graph": Path(global_config.get("graph_index_path", asset_dir / "global_graph.sqlite")),
         "manifest": Path(global_config.get("manifest_path", asset_dir / "manifest.json")),
     }
+
+
+def _write_manifest(paths: dict[str, Path], manifest: dict) -> None:
+    manifest["assets"] = {key: str(value) for key, value in paths.items() if key != "asset_dir"}
+    write_json(paths["manifest"], manifest)
 
 
 def main() -> None:
@@ -48,6 +58,10 @@ def main() -> None:
             manifest["corpus"] = build_paragraph_corpus(inputs, paths["corpus"])
         else:
             print(f"Reusing corpus: {paths['corpus']}")
+            if "corpus" not in manifest:
+                manifest["corpus"] = inspect_paragraph_corpus(inputs, paths["corpus"])
+                print("Recovered missing corpus metadata in asset manifest")
+        _write_manifest(paths, manifest)
 
     if args.stage in ("all", "embeddings"):
         if not paths["corpus"].exists():
@@ -63,6 +77,11 @@ def main() -> None:
             manifest["embedding"] = config.get("embedding", {})
         else:
             print(f"Reusing embeddings and FAISS: {paths['embeddings']}, {paths['faiss']}")
+            if "semantic_index" not in manifest:
+                manifest["semantic_index"] = inspect_semantic_assets(paths["embeddings"], paths["faiss"])
+                print("Recovered missing semantic index metadata in asset manifest")
+        manifest["embedding"] = config.get("embedding", {})
+        _write_manifest(paths, manifest)
 
     if args.stage in ("all", "graph"):
         if not paths["corpus"].exists():
@@ -74,9 +93,12 @@ def main() -> None:
             manifest["global_graph"] = build_global_graph_index(paths["corpus"], extraction_path, paths["graph"])
         else:
             print(f"Reusing global graph: {paths['graph']}")
+            if "global_graph" not in manifest:
+                manifest["global_graph"] = inspect_global_graph_index(paths["graph"])
+                print("Recovered available global graph metadata in asset manifest")
+        _write_manifest(paths, manifest)
 
-    manifest["assets"] = {key: str(value) for key, value in paths.items() if key != "asset_dir"}
-    write_json(paths["manifest"], manifest)
+    _write_manifest(paths, manifest)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
 

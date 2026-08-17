@@ -9,7 +9,13 @@ class Query:
     query_id: str
     text: str
     user_id: str | None = None
+    seed_candidate_ids: tuple[str, ...] = ()
+    excluded_candidate_ids: tuple[str, ...] = ()
+    allowed_candidate_ids: tuple[str, ...] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    seed_candidate_weights: tuple[float, ...] = ()
+    seed_node_ids: tuple[str, ...] = ()
+    seed_node_weights: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)

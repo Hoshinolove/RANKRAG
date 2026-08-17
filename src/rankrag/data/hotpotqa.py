@@ -23,6 +23,9 @@ class HotpotQAAdapter(DatasetAdapter):
                 return
             yield self._convert(record, use_paragraph_ids=self.use_paragraph_ids)
 
+    def source_paths(self) -> tuple[Path, ...]:
+        return (self.path,)
+
     @staticmethod
     def _convert(record: dict[str, Any], use_paragraph_ids: bool = False) -> RecommendationInstance:
         context = record.get("context", {})

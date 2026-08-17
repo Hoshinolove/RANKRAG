@@ -91,6 +91,7 @@ llm:
   max_text_chars: 4000
 
 evaluation:
+  split: validation
   ks: [5, 10]
 
 output:

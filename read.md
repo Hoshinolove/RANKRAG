@@ -9,7 +9,6 @@ Query + Candidate + Graph → Relevance Score → Candidate Ranking
 这里“推荐”采用广义定义：
 
 * HotpotQA：Query 是 question，Candidate 是 paragraph，目标是推荐/排序相关 evidence paragraphs。
-* MovieLens：Query 是 user preference/history，Candidate 是 movie。
 * Amazon：Query 是 user preference/history，Candidate 是 product。
 * Yelp：Query 是 user preference/history，Candidate 是 business。
 * 后续还可能扩展 MIND、2WikiMultiHopQA、MuSiQue 等。
@@ -276,7 +275,7 @@ class Edge:
 
 # 7. 第一阶段只实现 HotpotQA
 
-当前先不要实现 MovieLens/Amazon/Yelp。
+当前先不要实现 Amazon/Yelp。
 
 先用 HotpotQA 把整个系统跑通。
 
@@ -479,7 +478,6 @@ HotpotQA 跑通以后，我会继续增加：
 ```text
 2WikiMultiHopQA
 MuSiQue
-MovieLens
 Amazon
 Yelp
 MIND
@@ -531,10 +529,12 @@ LLM Top-10
 * 当前指标
 * 下一阶段准备做什么
 
-不要未经说明大规模重构已有可运行代码。
-开发环境约束
 
-重要 开发环境：
+
+重要 
+data和rag是旧代码的一些结果 能用则用 不好用就不用
+
+开发环境：
 
 本地电脑使用 Codex 编写代码
 远程服务器负责运行训练和实验

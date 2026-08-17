@@ -24,6 +24,26 @@ def resolve_shard_path(manifest: dict[str, Any], relative_path: str) -> Path:
     return Path(manifest["_manifest_dir"]) / relative_path
 
 
+def load_split_query_ids(manifest: dict[str, Any], split: str) -> list[str]:
+    """Load and validate the query order recorded by tensor shard sidecars."""
+    if split not in manifest["splits"]:
+        available = ", ".join(sorted(manifest["splits"]))
+        raise ValueError(f"Unknown ranker split {split!r}; available splits: {available}")
+    query_ids: list[str] = []
+    for shard_info in manifest["splits"][split]["shards"]:
+        metadata_path = resolve_shard_path(manifest, shard_info["metadata"])
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            query_ids.extend(str(json.loads(line)["query_id"]) for line in handle if line.strip())
+    expected_count = int(manifest["splits"][split]["count"])
+    if len(query_ids) != expected_count:
+        raise ValueError(
+            f"Ranker split {split!r} declares {expected_count} queries but its sidecars contain {len(query_ids)}"
+        )
+    if len(set(query_ids)) != len(query_ids):
+        raise ValueError(f"Ranker split {split!r} contains duplicate query IDs")
+    return query_ids
+
+
 class TensorShardBatchDataset(IterableDataset):
     """Loads one tensor shard at a time and yields already-batched query lists."""
 

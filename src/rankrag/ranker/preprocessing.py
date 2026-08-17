@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from rankrag.data.paragraph_corpus import ParagraphCorpus
+from rankrag.data.factory import create_candidate_corpus
 from rankrag.embedding import create_embedder
 from rankrag.io import iter_results, write_json
 from rankrag.ranker.features import RankerFeatureBuilder
@@ -79,9 +79,12 @@ def prepare_ranker_dataset(config: dict[str, Any]) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     candidate_k = int(dataset_config.get("candidate_k", 100))
     shard_size = int(dataset_config.get("shard_size", 512))
+    split_strategy = str(dataset_config.get("split_strategy", "hash"))
     validation_fraction = float(dataset_config.get("validation_fraction", 0.1))
-    if not 0.0 < validation_fraction < 1.0:
+    if split_strategy == "hash" and not 0.0 < validation_fraction < 1.0:
         raise ValueError("ranker_dataset.validation_fraction must be between 0 and 1")
+    if split_strategy not in {"hash", "source"}:
+        raise ValueError("ranker_dataset.split_strategy must be hash or source")
     seed = int(dataset_config.get("split_seed", 13))
     storage_dtype_name = dataset_config.get("storage_dtype", "float16")
     storage_dtype = {"float16": torch.float16, "float32": torch.float32}[storage_dtype_name]
@@ -93,22 +96,24 @@ def prepare_ranker_dataset(config: dict[str, Any]) -> Path:
         asset_dir = Path(global_config.get("asset_dir", "outputs/global_retrieval"))
         corpus_path = Path(global_config.get("corpus_path", asset_dir / "corpus.jsonl"))
         embeddings_path = Path(global_config.get("embeddings_path", asset_dir / "paragraph_embeddings.npy"))
-        corpus = ParagraphCorpus.load(corpus_path)
+        corpus = create_candidate_corpus(config)
         corpus_embeddings = np.load(embeddings_path, mmap_mode="r")
         if corpus_embeddings.shape != (len(corpus), feature_builder.embedder.dimension):
             raise ValueError("Offline corpus embeddings do not match the ranker embedder")
-    writers = {
-        split: _ShardWriter(output_dir, split, shard_size, storage_dtype)
-        for split in ("train", "validation")
-    }
+    split_names = (
+        [str(value) for value in dataset_config.get("source_splits", ["train", "validation", "test"])]
+        if split_strategy == "source"
+        else ["train", "validation"]
+    )
+    writers = {split: _ShardWriter(output_dir, split, shard_size, storage_dtype) for split in split_names}
     total = skipped_no_positive = truncated = 0
     for result in iter_results(graph_path):
         candidate_embeddings = None
         if corpus is not None and corpus_embeddings is not None:
             try:
-                rows = [corpus.id_to_row[candidate.candidate_id] for candidate in result.candidates]
+                rows = [corpus.row_for_id(candidate.candidate_id) for candidate in result.candidates]
             except KeyError as exc:
-                raise KeyError(f"GraphRAG candidate is missing from the global paragraph corpus: {exc.args[0]}") from exc
+                raise KeyError(f"GraphRAG candidate is missing from the global candidate corpus: {exc.args[0]}") from exc
             candidate_embeddings = np.asarray(corpus_embeddings[rows])
         raw_features = feature_builder.build(result, candidate_embeddings=candidate_embeddings)
         valid_count = min(candidate_k, len(result.candidates))
@@ -125,7 +130,15 @@ def prepare_ranker_dataset(config: dict[str, Any]) -> Path:
         mask[:valid_count] = True
         if not labels.any():
             skipped_no_positive += 1
-        split = _split_for_query(result.query_id, validation_fraction, seed)
+        if split_strategy == "source":
+            split = str(result.metadata.get("split", ""))
+            if split not in writers:
+                raise ValueError(
+                    f"GraphRAG result {result.query_id!r} has unknown source split {split!r}; "
+                    f"expected one of {sorted(writers)}"
+                )
+        else:
+            split = _split_for_query(result.query_id, validation_fraction, seed)
         writers[split].add(
             torch.from_numpy(features),
             torch.from_numpy(labels),
@@ -134,7 +147,8 @@ def prepare_ranker_dataset(config: dict[str, Any]) -> Path:
         )
         total += 1
         if total % 1000 == 0:
-            print(f"prepared={total} train={writers['train'].count} validation={writers['validation'].count}", flush=True)
+            counts = " ".join(f"{name}={writer.count}" for name, writer in writers.items())
+            print(f"prepared={total} {counts}", flush=True)
     for writer in writers.values():
         writer.flush()
     manifest = {
@@ -144,6 +158,7 @@ def prepare_ranker_dataset(config: dict[str, Any]) -> Path:
         "feature_dim": feature_builder.dimension,
         "feature_layout": "[query,candidate,query*candidate,abs(query-candidate),graph_features]",
         "storage_dtype": storage_dtype_name,
+        "split_strategy": split_strategy,
         "embedding": config.get("embedding", {}),
         "statistics": {
             "total_queries": total,

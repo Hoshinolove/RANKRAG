@@ -9,6 +9,7 @@ from typing import Any, Sequence
 
 from rankrag.data.json_stream import iter_json_array
 from rankrag.models import Candidate
+from rankrag.data.candidate_corpus import CandidateCorpus
 
 
 def paragraph_id(title: str, text: str) -> str:
@@ -31,7 +32,7 @@ class ParagraphRecord:
         )
 
 
-class ParagraphCorpus:
+class ParagraphCorpus(CandidateCorpus):
     """Immutable, row-addressable paragraph corpus used by the FAISS index."""
 
     def __init__(self, records: Sequence[ParagraphRecord]) -> None:
@@ -45,6 +46,19 @@ class ParagraphCorpus:
 
     def candidate(self, paragraph_id_value: str) -> Candidate:
         return self.records[self.id_to_row[paragraph_id_value]].to_candidate()
+
+    def candidate_at(self, row: int) -> Candidate:
+        return self.records[row].to_candidate()
+
+    def candidate_id_at(self, row: int) -> str:
+        return self.records[row].paragraph_id
+
+    def row_for_id(self, candidate_id: str) -> int:
+        return self.id_to_row[candidate_id]
+
+    def embedding_text_at(self, row: int) -> str:
+        record = self.records[row]
+        return f"{record.title}\n{record.text}".strip()
 
     @classmethod
     def load(cls, path: str | Path) -> "ParagraphCorpus":

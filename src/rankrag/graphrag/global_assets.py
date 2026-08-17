@@ -10,7 +10,9 @@ from typing import Any, Iterable, Iterator, Sequence
 import numpy as np
 
 from rankrag.data.paragraph_corpus import ParagraphCorpus
+from rankrag.data.candidate_corpus import CandidateCorpus, load_candidate_corpus
 from rankrag.embedding import TextEmbedder
+from rankrag.graph.candidate_index import CandidateGraphIndex
 
 
 def normalize_entity(value: str) -> str:
@@ -35,7 +37,7 @@ def build_semantic_assets(
     except ImportError as exc:
         raise RuntimeError("FAISS is required; install faiss-cpu or faiss-gpu before building retrieval assets") from exc
 
-    corpus = ParagraphCorpus.load(corpus_path)
+    corpus = load_candidate_corpus(corpus_path)
     embeddings_destination = Path(embeddings_path)
     faiss_destination = Path(faiss_path)
     embeddings_destination.parent.mkdir(parents=True, exist_ok=True)
@@ -48,7 +50,7 @@ def build_semantic_assets(
     )
     index = faiss.IndexFlatIP(embedder.dimension)
     for start in range(0, len(corpus), batch_size):
-        texts = [f"{record.title}\n{record.text}" for record in corpus.records[start : start + batch_size]]
+        texts = corpus.embedding_texts(start, min(start + batch_size, len(corpus)))
         vectors = np.asarray(embedder.encode(texts), dtype=np.float32)
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         vectors /= np.maximum(norms, 1e-12)
@@ -96,10 +98,10 @@ def inspect_semantic_assets(embeddings_path: str | Path, faiss_path: str | Path)
     }
 
 
-class SemanticParagraphIndex:
+class SemanticCandidateIndex:
     def __init__(
         self,
-        corpus: ParagraphCorpus,
+        corpus: CandidateCorpus,
         embeddings_path: str | Path,
         faiss_path: str | Path | None,
         backend: str = "faiss",
@@ -147,7 +149,7 @@ class SemanticParagraphIndex:
             scores, rows = self.index.search(vectors, top_k)
             return [
                 [
-                    (self.corpus.records[int(row)].paragraph_id, float(score))
+                    (self.corpus.candidate_id_at(int(row)), float(score))
                     for row, score in zip(query_rows, query_scores, strict=True)
                     if int(row) >= 0
                 ]
@@ -159,7 +161,7 @@ class SemanticParagraphIndex:
             query_rows = np.argsort(-query_scores, kind="stable")[:top_k]
             results.append(
                 [
-                    (self.corpus.records[int(row)].paragraph_id, float(query_scores[int(row)]))
+                    (self.corpus.candidate_id_at(int(row)), float(query_scores[int(row)]))
                     for row in query_rows
                 ]
             )
@@ -168,7 +170,7 @@ class SemanticParagraphIndex:
     def scores(self, query_vector: np.ndarray, paragraph_ids: Sequence[str]) -> dict[str, float]:
         if not paragraph_ids:
             return {}
-        rows = [self.corpus.id_to_row[pid] for pid in paragraph_ids]
+        rows = [self.corpus.row_for_id(pid) for pid in paragraph_ids]
         vector = np.asarray(query_vector, dtype=np.float32)
         vector /= max(float(np.linalg.norm(vector)), 1e-12)
         values = np.asarray(self.embeddings[rows] @ vector)
@@ -322,10 +324,12 @@ def inspect_global_graph_index(path: str | Path) -> dict[str, int | None]:
     return counts
 
 
-class GlobalGraphIndex:
+class GlobalGraphIndex(CandidateGraphIndex):
     """Read-only access to the three global KG mappings."""
 
     def __init__(self, path: str | Path) -> None:
+        self.backend = "hotpot_legacy_sqlite"
+        self.path = Path(path)
         uri = f"file:{Path(path).resolve().as_posix()}?mode=ro"
         self.connection = sqlite3.connect(uri, uri=True)
 
@@ -386,3 +390,53 @@ class GlobalGraphIndex:
 
     def close(self) -> None:
         self.connection.close()
+
+    def nodes_for_candidates(self, candidate_ids: Sequence[str]) -> dict[str, list[str]]:
+        return {
+            candidate_id: [f"entity::{entity_id}" for entity_id in entity_ids]
+            for candidate_id, entity_ids in self.entities_for_paragraphs(candidate_ids).items()
+        }
+
+    def candidates_for_nodes(self, node_ids: Sequence[str], per_node_limit: int) -> dict[str, list[str]]:
+        raw_ids = [node_id.removeprefix("entity::") for node_id in node_ids]
+        raw = self.paragraphs_for_entities(raw_ids, per_node_limit)
+        return {f"entity::{node_id}": candidate_ids for node_id, candidate_ids in raw.items()}
+
+    def neighbors(self, node_ids: Sequence[str], per_node_limit: int) -> dict[str, list[dict[str, Any]]]:
+        raw_ids = [node_id.removeprefix("entity::") for node_id in node_ids]
+        raw = self.adjacent_entities(raw_ids, per_node_limit)
+        return {
+            f"entity::{source}": [
+                {**edge, "target": f"entity::{edge['target']}", "weight": 1.0, "metadata": {}}
+                for edge in edges
+            ]
+            for source, edges in raw.items()
+        }
+
+    def node_metadata(self, node_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        raw_ids = [node_id.removeprefix("entity::") for node_id in node_ids]
+        raw = self.entity_metadata(raw_ids)
+        return {
+            f"entity::{node_id}": value
+            for node_id, value in raw.items()
+        }
+
+    def candidate_node_id(self, candidate_id: str) -> str:
+        return f"paragraph::{candidate_id}"
+
+    def candidate_id_from_node(self, node_id: str) -> str | None:
+        return node_id.removeprefix("paragraph::") if node_id.startswith("paragraph::") else None
+
+    def candidate_node_metadata(self, candidate_id: str) -> dict[str, Any]:
+        return {
+            "node_type": "paragraph",
+            "metadata": {"paragraph_id": candidate_id},
+            "include_corpus_metadata": False,
+        }
+
+    def candidate_association_relation(self, candidate_id: str, node_id: str) -> str:
+        return "mentions"
+
+
+# Backward-compatible public name used by existing imports and tests.
+SemanticParagraphIndex = SemanticCandidateIndex

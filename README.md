@@ -72,8 +72,8 @@ python -m pip install -r requirements.txt
 # 离线全局资产
 python prepare_global_retrieval.py --config configs/hotpotqa_train_fullkg.yaml --stage all
 
-# 全局 GraphRAG Top100
-python run_pipeline.py --config configs/hotpotqa_train_fullkg.yaml --stage graphrag --force
+# 全局 GraphRAG Top100；中断后重复本命令可从已完成 shard 恢复
+python run_pipeline.py --config configs/hotpotqa_train_fullkg.yaml --stage graphrag
 
 # 一次性 Tensor preprocessing
 python prepare_ranker_dataset.py --config configs/hotpotqa_train_fullkg.yaml
@@ -97,6 +97,7 @@ python run_pipeline.py --config configs/hotpotqa_train_fullkg.yaml --stage llm -
 outputs/hotpotqa/hotpot_train_global_graphrag/
 ├── graphrag.jsonl
 ├── graphrag_retrieval_stats.json
+├── graphrag_shards/         # 原子分片和恢复进度
 ├── ranker_dataset/
 ├── ranker_checkpoints/
 ├── neural.jsonl
@@ -105,7 +106,7 @@ outputs/hotpotqa/hotpot_train_global_graphrag/
 └── metrics.json
 ```
 
-`graphrag_retrieval_stats.json` 包含平均候选池大小、GraphRAG 前 gold recall、Recall@100、平均图扩展候选数和检索耗时。
+`graphrag_retrieval_stats.json` 包含平均候选池大小、GraphRAG 前 gold recall、Recall@100、平均图扩展候选数，以及 query embedding、semantic search、graph expansion、evidence serialization 和总 query 耗时。
 
 ## 测试
 

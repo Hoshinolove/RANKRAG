@@ -258,17 +258,9 @@ head -c 1500 outputs/kg_train_gliner_rebel/kg_extractions.jsonl
 echo
 ```
 
-## 9. 使用完整训练 KG 构建全局索引并运行 GraphRAG
+## 9. 使用完整训练 KG 运行 GraphRAG
 
-KG 合并成功后，先一次性构建全局 ParagraphCorpus、embedding、FAISS 和 KG 索引：
-
-```bash
-python prepare_global_retrieval.py \
-  --config configs/hotpotqa_train_fullkg.yaml \
-  --stage all
-```
-
-离线资产完成后执行：
+KG 合并成功后，执行：
 
 ```bash
 python run_pipeline.py \
@@ -280,13 +272,13 @@ python run_pipeline.py \
 GraphRAG 输出位置：
 
 ```text
-outputs/hotpotqa/hotpot_train_global_graphrag/graphrag.jsonl
+outputs/hotpotqa/hotpot_train_fullkg_graphrag/graphrag.jsonl
 ```
 
 检查 GraphRAG 是否处理完全部训练问题：
 
 ```bash
-wc -l outputs/hotpotqa/hotpot_train_global_graphrag/graphrag.jsonl
+wc -l outputs/hotpotqa/hotpot_train_fullkg_graphrag/graphrag.jsonl
 ```
 
 预期结果：
@@ -298,27 +290,20 @@ wc -l outputs/hotpotqa/hotpot_train_global_graphrag/graphrag.jsonl
 ## 10. 评估 GraphRAG
 
 ```bash
-python evaluate.py \
-  --config configs/hotpotqa_train_fullkg.yaml \
-  --stage graphrag
+  python evaluate.py \
+    --config configs/hotpotqa_train_fullkg.yaml \
+    --stage graphrag
 ```
 
 指标文件：
 
 ```text
-outputs/hotpotqa/hotpot_train_global_graphrag/metrics.json
+outputs/hotpotqa/hotpot_train_fullkg_graphrag/metrics.json
 ```
 
 ## 11. 训练 Neural Ranker（可选）
 
-GraphRAG 完成后，先一次性生成 Tensor 数据：
-
-```bash
-python prepare_ranker_dataset.py \
-  --config configs/hotpotqa_train_fullkg.yaml
-```
-
-然后训练 Candidate Set Transformer：
+GraphRAG 完成后，可以训练 Neural Ranker：
 
 ```bash
 python train.py \
@@ -328,11 +313,8 @@ python train.py \
 训练完成后会生成：
 
 ```text
-outputs/hotpotqa/hotpot_train_global_graphrag/ranker_checkpoints/best.pt
-outputs/hotpotqa/hotpot_train_global_graphrag/ranker_checkpoints/last.pt
+outputs/hotpotqa/hotpot_train_fullkg_graphrag/ranker.pt
 ```
-
-完整全局 GraphRAG 操作见 `RUN_GLOBAL_GRAPHRAG_CN.md`，完整 Neural 操作见 `RUN_TRAIN_NEURAL_CN.md`。
 
 ## 12. 显存不足时怎么办
 
@@ -366,6 +348,6 @@ batch_size: 1
 
 - 必须先完成所有 KG 分片，再执行合并。
 - 合并命令的 `--expected-count 483696` 不要删除，它会检查是否漏数据。
-- 运行 GraphRAG 时必须使用 `configs/hotpotqa_train_fullkg.yaml`；旧的局部 context 训练配置已经删除。
+- 运行 GraphRAG 时必须使用 `configs/hotpotqa_train_fullkg.yaml`，不能继续使用旧的 `configs/hotpotqa_train.yaml`。
 - 如果任务中断，优先重新执行原命令，不要删除已有 JSONL；脚本会断点续跑。
 - 如果模型下载失败，先确认服务器能访问 Hugging Face。
