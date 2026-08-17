@@ -52,6 +52,7 @@ def test_validation_inference_excludes_train_queries_and_stages_persist(tmp_path
     }
     prepare_ranker_dataset(config)
     train_tensor_ranker(config)
+    pipeline.prepare_graphrag_split("validation")
     pipeline.run_neural(split="validation")
     pipeline.run_llm()
     metrics = pipeline.evaluate()
@@ -74,4 +75,9 @@ def test_validation_inference_excludes_train_queries_and_stages_persist(tmp_path
     llm_results = list(iter_results(pipeline.llm_path))
     assert len(llm_results) == len(validation_ids)
     assert all(result.metadata["llm_cache_key"] for result in llm_results)
+    validation_graphrag_results = list(iter_results(pipeline.graphrag_validation_path))
+    assert [result.query_id for result in validation_graphrag_results] == [result.query_id for result in neural_results]
+    assert metrics["graphrag"]["queries"] == len(validation_ids)
+    assert metrics["neural"]["queries"] == len(validation_ids)
+    assert metrics["llm"]["queries"] == len(validation_ids)
     assert (pipeline.output_dir / "metrics.json").exists()

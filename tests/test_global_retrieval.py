@@ -139,7 +139,7 @@ def test_global_corpus_graph_and_hybrid_retrieval_do_not_inject_positives(tmp_pa
         semantic,
         graph,
         embedder,
-        HybridCandidateConfig(semantic_top_k=1, seed_paragraph_k=1, graph_hops=2, max_graph_candidates=10),
+        HybridCandidateConfig(semantic_top_k=1, seed_candidate_k=1, graph_hops=2, max_graph_candidates=10),
     )
     retriever = HybridGraphRAGRetriever(generator, WeightedCandidateScorer(), top_k=2)
     query = Query("q", "Where does Alice live?")
@@ -248,9 +248,12 @@ def test_evidence_metadata_is_loaded_only_for_selected_top_k(tmp_path):
         def __init__(self):
             self.requested_entities = set()
 
-        def entity_metadata(self, entity_ids):
-            self.requested_entities = set(entity_ids)
-            return {entity_id: {"name": entity_id} for entity_id in entity_ids}
+        def candidate_id_from_node(self, node_id):
+            return node_id.removeprefix("paragraph::") if node_id.startswith("paragraph::") else None
+
+        def node_metadata(self, node_ids):
+            self.requested_entities = {node_id.removeprefix("entity::") for node_id in node_ids}
+            return {node_id: {"name": node_id.removeprefix("entity::")} for node_id in node_ids}
 
     graph = RecordingGraph()
     generator = HybridCandidateGenerator(
@@ -265,7 +268,7 @@ def test_evidence_metadata_is_loaded_only_for_selected_top_k(tmp_path):
     pool = CandidatePool(
         candidates=[
             GeneratedCandidate(
-                paragraph_id=paragraph_id_value,
+                candidate_id=paragraph_id_value,
                 semantic_score=score,
                 paths=[
                     GlobalEvidencePath(
